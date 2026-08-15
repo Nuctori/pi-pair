@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.78] - 2026-08-15
+
+5 轮独立 subagent 对抗性审计第 1 轮（chain 追加/解析路径，reviewer fresh 只读）：
+
+- **readRaw 吞非 ENOENT 读错误（high）**：catch-all 把 EBUSY/EIO/EISDIR 当缺失 → append 按空链编号 D-001、rename 静默覆盖整条旧链（三重防线全失效：mtime 复校验通过、写后 verify 通过、末尾条目校验通过）。修复：仅 ENOENT 视为空链，其余抛错。测试：chain.md 换同名目录（EISDIR 实证）→ 读错误直接外抛而非笼统「并发冲突」。
+- **supersedes 元素未消毒（high）**：其余字段全过 cleanField，唯独 supersedes.join(", ") 原样写入 → `\n## D-099: fake [Accepted]` 注入伪条目。修复：元素逐个单行化+截断。测试：注入负载落盘后不得解析出 D-099。
+- **畸形条目导致 id 复用（medium）**：parseChain 宽容丢弃畸形条目（缺 `]`/裸 CR）→ nextId 复用文本中已有 id → 落盘双 D-004。修复：编号改从原文 `D-(\d+)` 扫描（含畸形条目文本，跳号无害碰撞致命）。测试：D-003+D-004(畸形) 追加 → D-005。
+- **summary 含 `[` 解析错位（medium）**：惰性 `(.+?)` 在首个 `[` 停下、贪婪 status 吞到末个 `]` → 中文摘要「增加 [分页] 支持」解析为摘要「增加」+ status「分页] 支持 [Accepted」。修复：ENTRY_RE 改贪婪 + status 取 `[^\]]+`。
+- **resolveProjectRoot 取最远祖先（low）**：注释「取最近」实际 best 被每个带标记祖先覆盖 → monorepo 子包串到外层根。修复：命中即 break。测试：嵌套 package.json/Cargo.toml。
+- **cleanField 截断劈开 surrogate pair（low）**：slice(0,max) 按 UTF-16 码元切 → 尾部孤立高代理；Node utf8 按 WTF-8 往返保留（非 U+FFFD 替换）→ 文件含非法 Unicode 标量。修复：截断后剥离尾部孤立高代理。测试：奇数偏移 emoji 摘要无残留代理。
+- **expectedMtime=null 跳过复校验（low）**：去掉 `expectedMtime !== null &&` 守卫，复校验无条件执行（需捕获+复校验两次 stat 都失败才漏检）。无确定性测试：瞬时 stat 失败无法注入（node:fs ESM 命名空间静态快照，Module 命名空间 [[Set]] 一律拒绝，mock.method/赋值均不可见——probe 实证），文档化守护。
+- **附带**：测试文件补 AuditState/AuditSignature 类型导入（潜伏类型错误）；既有「乐观锁重试」测试标注假阳性（其 fsModule 打桩从未生效，断言在无冲突路径碰巧通过，重试路径实际零覆盖）。
+- 验证：72/72 通过（+6 R1 测试），tsc 0。
+
 ## [1.0.77] - 2026-08-15
 
 reviewer 终审 Medium 处理：

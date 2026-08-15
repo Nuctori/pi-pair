@@ -57,6 +57,7 @@ import {
 	patchAuditState,
 	writeAuditState,
 } from "../lib/chain-store.js";
+import type { AuditSignature, AuditState } from "../lib/chain-store.js";
 function tmpDir(): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), "chain-store-test-"));
 }
@@ -2540,6 +2541,11 @@ test("v1.0.27：appendDecision 乐观锁重试（写 tmp 期间 mtime 变化触�
 	let bumped = false;
 	// 单进程模拟并发写者：首次 tmp 写时把 chain.md mtime 前拨（≈ 他写者已落盘）——
 	// rename 紧前复校验必冲突 → continue 重读重试（JD 审计 #2：重试路径此前零覆盖）
+	// ⚠ R1 审计发现：此打桩为假阳性——node:fs 的 ESM 命名空间是静态快照，
+	// 对 fsModule（module.exports）的赋值/defineProperty 均不可见（Node 24 实测，
+	// Module 命名空间对象 [[Set]] 一律拒绝）。bumped 永不触发 → 冲突从未发生，
+	// 断言在无冲突路径下碰巧通过，重试路径实际零覆盖（同 R1-F1/F7 的 mock 限制）。
+	// 重试路径由代码审查守护；若要真实覆盖需可注入的 stat/read 接缝（未做，YAGNI）。
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	(fsModule as any).writeFileSync = (...args: unknown[]) => {
 		if (!bumped) {
@@ -2757,4 +2763,139 @@ test("v1.0.29：writeAuditReport 跨会话交付落盘（D-036 项目文件）",
 		.readdirSync(path.dirname(file))
 		.filter((f) => f.includes(".tmp-"));
 	assert.deepEqual(leftovers, [], "无 tmp 残留（原子写清理）");
+	assert.deepEqual(leftovers, [], "无 tmp 残留（原子写清理）");
 });
+
+// ===== R1 对抗性审计回归（5 轮审计第 1 轮：chain 追加/解析路径）=====
+
+test("R1-F1: 非 ENOENT 读错误不得静默覆盖整链（EISDIR 实证）", () => {
+	const dir = tmpDir();
+	appendDecision(dir, {
+		summary: "原始决策",
+		context: "c",
+		decision: "d",
+		rationale: "r",
+	});
+	// chain.md 原位替换为同名目录 → 读抛 EISDIR（非 ENOENT 读失败的真实形态，
+	// 代表 EBUSY/权限/OneDrive 类错误；mock 对 node:fs 命名空间不可行——静态快照）
+	const file = chainPath(dir);
+	fs.rmSync(file);
+	fs.mkdirSync(file);
+	assert.throws(
+		() =>
+			appendDecision(dir, {
+				summary: "新决策",
+				context: "c",
+				decision: "d",
+				rationale: "r",
+			}),
+		(e: unknown) => !String((e as Error).message).includes("并发冲突"),
+		"读错误必须直接外抛（旧代码：吞错→按空链编号 D-001→rename 失败 3 次→笼统冲突）",
+	);
+	// 数据面未被触碰：链位置仍是目录
+	assert.ok(fs.statSync(file).isDirectory(), "链位置未被写覆盖");
+});
+
+test("R1-F2: supersedes 元素消毒（防 \\n 注入伪条目）", () => {
+	const dir = tmpDir();
+	appendDecision(dir, {
+		summary: "s",
+		context: "c",
+		decision: "d",
+		rationale: "r",
+	});
+	const e = appendDecision(dir, {
+		summary: "s2",
+		context: "c",
+		decision: "d",
+		rationale: "r",
+		supersedes: ["D-001\n## D-099: fake [Accepted]\n- Context: x"],
+	});
+	const parsed = parseChain(readRaw(dir));
+	assert.equal(
+		parsed.filter((x) => x.id === "D-099").length,
+		0,
+		"注入的伪条目不得被解析为决策",
+	);
+	assert.equal(parsed.length, 2, "只有两条真实决策");
+	assert.ok(e.supersedes?.every((s) => !s.includes("\n")), "supersedes 单行化");
+});
+
+test("R1-F3: 畸形条目存在时新 id 不与文本中已有 id 冲突", () => {
+	const dir = tmpDir();
+	// D-003 正常 + D-004 畸形（缺 ]）→ parse 静默丢弃 D-004
+	const file = chainPath(dir);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	fs.writeFileSync(
+		file,
+		`# Decision Chain
+
+## D-003: ok [Accepted]
+- Context: x
+- Date: 2024-01-01T00:00:00.000Z
+
+## D-004: broken [Accepted
+- Context: x
+
+`,
+		"utf-8",
+	);
+	const e = appendDecision(dir, {
+		summary: "s",
+		context: "c",
+		decision: "d",
+		rationale: "r",
+	});
+	assert.notEqual(e.id, "D-004", "不得复用文本中已出现的 id（畸形条目不计入 parse）");
+	const ids = parseChain(readRaw(dir)).map((x) => x.id);
+	assert.equal(new Set(ids).size, ids.length, "落盘后解析无重复 id");
+});
+
+test("R1-F4: summary 含 [ 时解析不错位（status 取最后一个方括号）", () => {
+	const dir = tmpDir();
+	appendDecision(dir, {
+		summary: "增加 [分页] 支持",
+		context: "c",
+		decision: "d",
+		rationale: "r",
+	});
+	const [p] = parseChain(readRaw(dir));
+	assert.equal(p.summary, "增加 [分页] 支持");
+	assert.equal(p.status, "Accepted");
+});
+
+test("R1-F5: resolveProjectRoot 取最近带标记祖先（嵌套标记）", () => {
+	const root = tmpDir();
+	fs.writeFileSync(path.join(root, "package.json"), "{}", "utf-8");
+	const inner = path.join(root, "packages", "app");
+	fs.mkdirSync(inner, { recursive: true });
+	fs.writeFileSync(path.join(inner, "package.json"), "{}", "utf-8");
+	assert.equal(resolveProjectRoot(inner), inner, "最近带标记祖先（monorepo 子包）");
+});
+
+test("R1-F6: cleanField 截断不切开 surrogate pair", () => {
+	const dir = tmpDir();
+	// "a🚀" = 3 code units；×67 = 201 units > 200 上限 → slice(0,200) 恰切在
+	// 第 67 个 🚀 的高代理之后（奇数偏移保证切进配对中间）
+	const s = "a🚀".repeat(67);
+	appendDecision(dir, {
+		summary: s,
+		context: "c",
+		decision: "d",
+		rationale: "r",
+	});
+	const [p] = parseChain(readRaw(dir));
+	assert.ok(p.summary.length <= 200, "summary 被截断（触发切分路径）");
+	const stripped = p.summary.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, "");
+	assert.ok(
+		!/[\uD800-\uDBFF\uDC00-\uDFFF]/.test(stripped),
+		"截断后不得残留孤立代理（Node utf8 往返按 WTF-8 保留孤立代理，会污染文件）",
+	);
+});
+
+// R1-F7（修复已应用，无确定性测试）：expectedMtime=null 仅由 statSync 瞬时失败产生
+// （ensureChain 保证文件存在；ELOOP/EBUSY 是持续性失败，新旧代码在 rename 处同样抛错，
+// 无法区分）。node:fs ESM 命名空间是静态快照、属性不可重定义，mock 不可行。
+// 修复：去掉 `expectedMtime !== null &&` 守卫 → 复校验无条件执行，漏检需
+// 「捕获 stat 失败 + 复校验 stat 也失败（null===null）+ 其间并发写者」三重条件。
+// 由代码审查 + 本注释守护。

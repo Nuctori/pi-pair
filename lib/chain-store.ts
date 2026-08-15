@@ -23,7 +23,9 @@ export interface DecisionEntry extends DecisionFields {
 	date: string;
 }
 
-const ENTRY_RE = /^## (D-\d+): (.+?) \[(.+)\]\r?\n((?:^- .*(?:\r?\n|$))*)/gm;
+// R1-F4：status 取最后一个方括号——惰性 `(.+?)` 在 summary 的第一个 `[` 停下
+// → 摘要截断、status 变垃圾（中文摘要常含 `[标注]`）
+const ENTRY_RE = /^## (D-\d+): (.+) \[([^\]]+)\]\r?\n((?:^- .*(?:\r?\n|$))*)/gm;
 const FIELD_RE = /^- (\w+): (.*)$/gm;
 const HEADER = `# Decision Chain
 
@@ -85,7 +87,10 @@ export function resolveProjectRoot(cwd: string): string {
 			const hasMarker = PROJECT_ROOT_MARKERS.some((m) =>
 				fs.existsSync(path.join(cur, m)),
 			);
-			if (hasMarker) best = cur;
+			if (hasMarker) {
+				best = cur;
+				break; // R1-F5：取最近带标记祖先——继续向上会被远祖覆盖（monorepo 子包串到根）
+			}
 			const parent = path.dirname(cur);
 			if (parent === cur) break;
 			cur = parent;
@@ -105,13 +110,15 @@ export function ensureChain(cwd: string): string {
 	return file;
 }
 
-/** 读文件原文；缺失视为空链。 */
+/** 读文件原文；缺失（ENOENT）视为空链，其他读错误抛错
+ *  R1-F1：把 EBUSY/EIO 当缺失 → append 按空链编号 D-001、rename 静默覆盖整条旧链。 */
 export function readRaw(cwd: string): string {
 	const file = chainPath(cwd);
 	try {
 		return fs.readFileSync(file, "utf-8");
-	} catch {
-		return HEADER;
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return HEADER;
+		throw e;
 	}
 }
 
@@ -177,16 +184,27 @@ export function appendDecision(
 		// 写前校验通过、rename 覆盖他写者条目且双方都成功返回——决策链静默丢条目
 		const expectedMtime = chainMtime(file);
 		const raw = readRaw(cwd);
-		const entries = parseChain(raw);
-		const id = nextId(entries);
-		const supersedes =
-			fields.supersedes && fields.supersedes.length > 0
-				? fields.supersedes
-				: undefined;
+		// R1-F3：编号从原文扫描（含畸形条目文本）——parseChain 宽容丢弃畸形条目时
+		// nextId(entries) 会复用文本中已有 id → 落盘后重复编号。正文提及的 id 也计入
+		// （跳号无害，碰撞致命）。
+		let max = 0;
+		for (const m of raw.matchAll(/D-(\d+)/g)) {
+			const n = Number(m[1]);
+			if (Number.isFinite(n) && n > max) max = n;
+		}
+		const id = `D-${String(max + 1).padStart(3, "0")}`;
 		// 字段消毒（v1.0.27 双审计 FP#5a）：\n 可注入伪条目（parseChain 按行解析，
 		// 宽容解析会把断行当新条目）；无长度上限 → 链无界增长。单行化 + 截断。
-		const cleanField = (s: string, max: number): string =>
-			s.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+		// R1-F6：slice 按 UTF-16 码元截断可切开 surrogate pair → 剥离尾部孤立高代理。
+		const cleanField = (s: string, max: number): string => {
+			const t = s.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
+			return t.length > max ? t.slice(0, max).replace(/[\uD800-\uDBFF]$/, "") : t;
+		};
+		// R1-F2：supersedes 元素也过消毒（其余字段全消毒唯独这里漏 → \n 注入伪条目）
+		const supersedes =
+			fields.supersedes && fields.supersedes.length > 0
+				? fields.supersedes.map((s) => cleanField(s, 200)).filter((s) => s.length > 0)
+				: undefined;
 		const entry: DecisionEntry = {
 			...fields,
 			summary: cleanField(fields.summary, 200),
@@ -218,10 +236,9 @@ export function appendDecision(
 		const tmp = `${file}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		try {
 			fs.writeFileSync(tmp, payload, "utf-8");
-			// rename 紧前 mtime 复校验（v1.0.27）：把 stat→rename 窗口缩到 µs 级——
-			// 两写者均通过写前校验后交错 rename → 后写者覆盖先写者且双方返回成功
-			// （write-after-verify 只检测"最终内容 ≠ 自身 payload"，恰好漏掉该交错）
-			if (expectedMtime !== null && chainMtime(file) !== expectedMtime) {
+			// R1-F7：expectedMtime=null（stat 瞬时失败）时不得跳过复校验——
+			// 需两处 stat 同时失败（null===null）才漏检，窗口远窄于无条件跳过。
+			if (chainMtime(file) !== expectedMtime) {
 				try {
 					fs.unlinkSync(tmp);
 				} catch {
