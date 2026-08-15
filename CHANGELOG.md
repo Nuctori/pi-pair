@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.80] - 2026-08-15
+
+5 轮独立 subagent 对抗性审计第 3 轮（state 机，reviewer fresh 只读）：
+
+- **sweepAtomicWrites 清掉可解析备份（medium）**：只保留最新 1 份 .corrupt-*，而最新一份按构造是刚 rename 的损坏文件（大概率不可解析）→ 可解析旧备份被清 → 下次损坏重建无进度来源（LC-09 失效，进度归零）。修复：保留最新 2 份（有界）。测试：R3-F1 + T3 契约更新。
+- **读侧自愈覆盖有效文件（medium）**：readAuditState 首读瞬时失败（EBUSY/竞态半程）→ 重读已完整 → tryRecoverAuditState 仍走 ② 用陈旧 .corrupt 备份覆盖有效文件（锁复活/进度回退）。修复：入口先解析当前 raw，可解析则直接返回不写盘。瞬时窗口不可确定性注入，测试缺（同 R1-F7 类），文档化。
+- **损坏重建吞 blockedStreak 清零补丁（low）**：非默认值过滤只豁免 inFlight/auditFindings/lastError——recordSignature 的 blockedStreak:0（passed 清零）0 === DEFAULT 被过滤 → 备份旧 streak 存活 → A2 门禁误触发。修复：blockedStreak 加入总是覆盖列表。测试：R3-F3。
+- **resetForSessionStart 违反 F-01 函数式重派生（low）**：auditDead 在 patch 前用早读快照计算，间隙他写者获取新锁时陈旧 inFlight:false 清掉新鲜锁 → 双实例并发 spawn。修复：改 `(latest) => ...` 函数式。并发语义不可注入，测试缺，文档化。
+- **state.json 缺失但备份存在时进度归零（low）**：`if (existsSync)` / `if (backup)` 门跳过 .corrupt-* 扫描——SIGKILL 落在 rename 窗口（损坏文件已移走、新文件未落盘）或备份 rename 失败时，存量可解析备份的进度整体归零。修复：备份块重构——rename 仅在文件存在时执行，候选扫描无条件运行。测试：R3-F5（缺失 + 备份存在 → gatedHead 恢复、patch 字段优先）。
+- **非法 signature.status 通过消毒（low）**：只查 `!== undefined`，LLM 写垃圾 status（数字/拼写错误）→ isAuditCompleted 视非 failed 为完成 → 门禁误开 + blockers 静默丢失。修复：status 必须在 4 合法值内，否则签名丢弃（fail-closed）。测试：R3-F6（status: 42 → signature null）。
+- 验证：83/83 通过（+4 R3 测试 + T3 契约更新），tsc 0。
+
 ## [1.0.79] - 2026-08-15
 
 5 轮独立 subagent 对抗性审计第 2 轮（audit-log/backfill/clamp/queryGaps 路径，reviewer fresh 只读）：

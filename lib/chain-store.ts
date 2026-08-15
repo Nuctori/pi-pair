@@ -994,7 +994,13 @@ function parseAuditState(obj: Partial<AuditState>): AuditState {
 			obj.signature &&
 			typeof obj.signature === "object" &&
 			!Array.isArray(obj.signature) &&
-			(obj.signature as AuditSignature).status !== undefined
+			(obj.signature as AuditSignature).status !== undefined &&
+			// R3-F6：非法 status（LLM 写数字/拼写错误）→ 丢弃签名（fail-closed）——
+			// 旧代码只查 !== undefined，垃圾 status 通过消毒后 isAuditCompleted 视非
+			// failed 为完成 → 门禁误开且 blockers 静默丢失
+			(["passed", "blocked", "passed-with-warning", "failed"] as string[]).includes(
+				String((obj.signature as AuditSignature).status),
+			)
 				? {
 						status: (obj.signature as AuditSignature).status,
 						at:
@@ -1059,6 +1065,14 @@ function atomicWriteState(cwd: string, content: string): boolean {
  *  截断写被杀半程的典型形态）→ .corrupt 备份恢复（损坏写入时扩展备份的最新 1 份）。
  *  返回 null = 恢复失败（维持 warn + DEFAULT 行为）。 */
 function tryRecoverAuditState(cwd: string, raw: string): AuditState | null {
+	// R3-F2：当前内容已可解析（首次读瞬时失败/竞态读到半程，重读已完整）→
+	// 直接返回，不写盘不恢复——旧代码会走 ② 用陈旧 .corrupt 备份覆盖有效文件
+	// （锁复活/进度回退）。损坏才进修复路径。
+	try {
+		return parseAuditState(JSON.parse(raw) as Partial<AuditState>);
+	} catch {
+		/* 确实损坏 → 走修复 */
+	}
 	// ① 截断修复：仅当 raw + "}" 可解析（真实缺对象闭合）才写回，中间损坏不会误修
 	try {
 		const repaired = raw + "}";
@@ -1186,7 +1200,9 @@ function sweepAtomicWrites(file: string): void {
 			}
 		}
 		corrupts.sort((a, b) => b.m - a.m);
-		for (const c of corrupts.slice(1)) {
+		// R3-F1：保留最新 2 份——最新一份按构造是刚 rename 的损坏文件（大概率不可解析），
+		// 只留 1 份会把可解析的旧备份清掉 → 下次损坏重建无进度来源（LC-09 失效）
+		for (const c of corrupts.slice(2)) {
 			try {
 				fs.unlinkSync(c.p);
 			} catch {
@@ -1256,16 +1272,19 @@ export function writeAuditState(
 		>;
 		merged = { ...raw, ...state };
 	} catch {
-		// 文件缺失（首次）或损坏：损坏则先备份再重建，防进度被默认值覆盖
-		if (fs.existsSync(file)) {
-			let backup = "";
-			try {
+		// 文件缺失（首次）或损坏：损坏则先备份再重建，防进度被默认值覆盖。
+		// R3-F5：备份 rename 失败/文件已缺失（SIGKILL 落在 rename 窗口）时仍须扫描
+		// .corrupt-* ——旧代码 `if (backup)` / `if (existsSync)` 门跳过扫描 → 进度归零。
+		let backup = "";
+		try {
+			if (fs.existsSync(file)) {
 				backup = `${file}.corrupt-${Date.now()}`;
 				fs.renameSync(file, backup);
 				console.warn(`audit state 损坏，已备份为 .corrupt-* 后重建: ${file}`);
-			} catch {
-				/* 备份失败不阻塞写 */
 			}
+		} catch {
+			/* 备份失败不阻塞写 */
+		}
 			// LC-09：从备份恢复可解析字段（备份损坏/缺失时回退传入快照）。
 			// 注意 merge 顺序：传入 state 是「损坏时 readAuditState 返回的 DEFAULT +
 			// patch 字段」——直接 {...备份, ...state} 会让 DEFAULT 默认值覆盖备份的
@@ -1273,9 +1292,9 @@ export function writeAuditState(
 			// 只让 state 中**非默认值**的字段（= 本次 patch 真正设置的）覆盖备份。
 			// 新备份 = 刚 rename 的损坏文件（半程写），大概率不可解析——按 mtime 新→旧
 			// 扫描目录内全部 .corrupt-*，取第一个可解析的（上次损坏/IO 错误场景备份的
-			// 完整旧版可恢复进度；sweepAtomicWrites 保留最新 1 份，旧备份写前未被清）。
-			if (backup) {
-				const candidates = [backup];
+			// 完整旧版可恢复进度；sweepAtomicWrites 保留最新 2 份，旧备份写前未被清）。
+		{
+			const candidates = backup ? [backup] : [];
 				try {
 					const dirEntries = fs
 						.readdirSync(path.dirname(file), { withFileTypes: true })
@@ -1310,10 +1329,13 @@ export function writeAuditState(
 							// ——它们是操作语义不是进度（复审 Finding 2：failed 释放锁
 							// 补丁 inFlight:false、锁获取的 auditFindings:[] 清零若被过滤，
 							// 损坏重建后锁沿用备份 true → 有界停摆 / 陈旧 findings 被注入）
+							// R3-F3：blockedStreak 清零（passed 签名）同为重置语义——
+							// 0 === DEFAULT 被过滤会让备份的旧 streak 存活 → A2 门禁误触发
 							if (
 								key === "inFlight" ||
 								key === "auditFindings" ||
 								key === "lastError" ||
+								key === "blockedStreak" ||
 								state[key] !== DEFAULT_STATE[key]
 							) {
 								nonDefault[k] = state[key];
@@ -1328,7 +1350,6 @@ export function writeAuditState(
 				}
 			}
 		}
-	}
 	const payload = JSON.stringify(merged, null, 2);
 	fs.writeFileSync(tmp, payload, {
 		encoding: "utf-8",
@@ -1496,25 +1517,29 @@ function sameBlockers(
  * 否则保留锁让遗留审计者先收尾。 */
 export function resetForSessionStart(cwd: string): void {
 	try {
-		const state = readAuditState(cwd);
 		const totalLines = convLogLineCount(cwd);
-		const auditDead =
-			state.auditStartedAt === 0 ||
-			Date.now() - state.auditStartedAt >= IN_FLIGHT_TTL_MS;
-		patchAuditState(cwd, {
-			// 推进到当前行数 = 视为已覆盖旧会话的对话（不触发 needsSignoff）
-			signatureConvLine: totalLines,
-			// 保留上次签名状态作参考，但不再触发待签名
-			...(auditDead
-				? { inFlight: false }
-				: {
-						// 会话边界门禁覆盖泄露（v1.0.27 双审计 FP#1）：保留锁（遗留审计者
-						// 还在跑）时，本会话首轮提交的门禁不得被「窗口早于本会话提交」的
-						// 遗留签名满足——覆写 auditRunId 为新鲜值，遗留签名 runId 必然
-						// 不匹配 → 门禁可见降级、下轮全量重审；同时修复现网 auditRunId
-						// 空值导致 runId 身份校验整段空转的旁路（FP#2a）。
-						auditRunId: `reset-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
-					}),
+		// R3-F4：函数式重派生（F-01 模式）——auditDead 必须在锁获取点基于最新 state
+		// 计算；旧代码在 patch 前用早读快照算好 auditDead，间隙他写者获取新锁时
+		// 陈旧 inFlight:false 会清掉新鲜锁 → 双实例并发 spawn（F-01 锁劫持同类）。
+		patchAuditState(cwd, (latest) => {
+			const auditDead =
+				latest.auditStartedAt === 0 ||
+				Date.now() - latest.auditStartedAt >= IN_FLIGHT_TTL_MS;
+			return {
+				// 推进到当前行数 = 视为已覆盖旧会话的对话（不触发 needsSignoff）
+				signatureConvLine: totalLines,
+				// 保留上次签名状态作参考，但不再触发待签名
+				...(auditDead
+					? { inFlight: false }
+					: {
+							// 会话边界门禁覆盖泄露（v1.0.27 双审计 FP#1）：保留锁（遗留审计者
+							// 还在跑）时，本会话首轮提交的门禁不得被「窗口早于本会话提交」的
+							// 遗留签名满足——覆写 auditRunId 为新鲜值，遗留签名 runId 必然
+							// 不匹配 → 门禁可见降级、下轮全量重审；同时修复现网 auditRunId
+							// 空值导致 runId 身份校验整段空转的旁路（FP#2a）。
+							auditRunId: `reset-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+						}),
+			};
 		});
 	} catch {
 		/* noop */

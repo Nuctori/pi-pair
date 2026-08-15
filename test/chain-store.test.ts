@@ -2510,11 +2510,12 @@ test("T2：CJK 行宽（800 字符 ≈ 2.4KB/行）截断收敛不震荡（M2 �
 	);
 });
 
-test("T3：writeAuditState 清扫 .corrupt-*（保留最新 1 份）与 >24h .tmp-* 残留", () => {
+test("T3：writeAuditState 清扫 .corrupt-*（R3-F1 起保留最新 2 份）与 >24h .tmp-* 残留", () => {
 	const dir = tmpDir();
 	const file = auditStatePath(dir);
 	fs.mkdirSync(path.dirname(file), { recursive: true });
 	fs.writeFileSync(file + ".corrupt-old", "x");
+	fs.writeFileSync(file + ".corrupt-mid", "m");
 	fs.writeFileSync(file + ".corrupt-new", "y");
 	fs.writeFileSync(file + ".tmp-stale", "z");
 	fs.writeFileSync(file + ".tmp-fresh", "w");
@@ -2522,7 +2523,8 @@ test("T3：writeAuditState 清扫 .corrupt-*（保留最新 1 份）与 >24h .tm
 	fs.utimesSync(file + ".corrupt-old", old, old);
 	fs.utimesSync(file + ".tmp-stale", old, old);
 	writeAuditState(dir, { ...readAuditState(dir), inFlight: false });
-	assert.ok(!fs.existsSync(file + ".corrupt-old"), "旧 corrupt 备份被删");
+	assert.ok(!fs.existsSync(file + ".corrupt-old"), "最旧 corrupt 备份被删（只留最新 2 份）");
+	assert.ok(fs.existsSync(file + ".corrupt-mid"), "次新 corrupt 备份保留（R3-F1：最新一份按构造不可解析，需保留可解析旧备份）");
 	assert.ok(fs.existsSync(file + ".corrupt-new"), "最新 corrupt 备份保留");
 	assert.ok(!fs.existsSync(file + ".tmp-stale"), "24h 前 tmp 残留被删");
 	assert.ok(fs.existsSync(file + ".tmp-fresh"), "新鲜 tmp 保留");
@@ -3069,4 +3071,93 @@ test("R2-F8: runId 与 head 均空时不得每轮重复补写（无身份锚）"
 		"runId/head 均空（git 失败+无 runId）→ 无可锚定身份，不得补写（旧代码：每轮补写→无界增长）",
 	);
 	assert.equal(readAuditLog(dir).length, 1, "日志不增长");
+});
+
+// ===== R3 对抗性审计回归（5 轮审计第 3 轮：state 机）=====
+
+test("R3-F1: sweepAtomicWrites 保留最新 2 份 .corrupt-*（最新一份通常不可解析）", () => {
+	const dir = tmpDir();
+	const file = auditStatePath(dir);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	// corrupt-1 = 可解析旧备份（损坏重建的进度来源）；corrupt-2 = 更新但不可解析
+	// （刚 rename 的损坏文件——按构造不可解析）
+	fs.writeFileSync(
+		file + ".corrupt-1",
+		JSON.stringify({ lastAuditedId: "D-010", gatedHead: "abc123" }),
+		"utf-8",
+	);
+	fs.writeFileSync(file + ".corrupt-2", '{ "inFlight": tr', "utf-8");
+	const t1 = Date.now() - 60000;
+	const t2 = Date.now() - 30000;
+	fs.utimesSync(file + ".corrupt-1", new Date(t1), new Date(t1));
+	fs.utimesSync(file + ".corrupt-2", new Date(t2), new Date(t2));
+	// 触发一次写（sweep 在写前执行）
+	writeAuditState(dir, { ...readAuditState(dir), lastAuditedId: "D-011" });
+	assert.ok(
+		fs.existsSync(file + ".corrupt-1"),
+		"可解析旧备份必须保留（旧代码：只留最新 1 份 → 下次损坏重建无进度来源）",
+	);
+	assert.ok(fs.existsSync(file + ".corrupt-2"), "最新备份保留");
+});
+
+test("R3-F3: 损坏重建保留 blockedStreak 清零补丁（非默认值过滤不吞清零语义）", () => {
+	const dir = tmpDir();
+	const file = auditStatePath(dir);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	// 可解析备份：历史真实进度（blockedStreak 3 + lastAuditedId）
+	fs.writeFileSync(
+		file + ".corrupt-1",
+		JSON.stringify({ lastAuditedId: "D-010", blockedStreak: 3 }),
+		"utf-8",
+	);
+	// 当前文件损坏
+	fs.writeFileSync(file, '{ "inFlight": tr', "utf-8");
+	// passed 签名路径的清零补丁（recordSignature 语义：blockedStreak: 0）
+	const st = { ...readAuditState(tmpDir()), blockedStreak: 0 };
+	writeAuditState(dir, st);
+	const after = readAuditState(dir);
+	assert.equal(
+		after.blockedStreak,
+		0,
+		"清零补丁必须生效（旧代码：0 === DEFAULT 被过滤 → 备份的 3 存活 → A2 门禁误触发）",
+	);
+	assert.equal(after.lastAuditedId, "D-010", "备份真实进度仍恢复（非默认值字段不受影响）");
+});
+
+test("R3-F5: state.json 缺失但 .corrupt-* 备份存在时仍恢复进度", () => {
+	const dir = tmpDir();
+	const file = auditStatePath(dir);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	// SIGKILL 落在 rename 窗口：损坏文件已被移走、新文件未落盘 → state.json 缺失
+	fs.writeFileSync(
+		file + ".corrupt-1",
+		JSON.stringify({ lastAuditedId: "D-010", gatedHead: "abc123", blockedStreak: 2 }),
+		"utf-8",
+	);
+	const st = { ...readAuditState(tmpDir()), lastAuditedId: "D-011" };
+	writeAuditState(dir, st);
+	const after = readAuditState(dir);
+	assert.equal(
+		after.gatedHead,
+		"abc123",
+		"备份进度必须恢复（旧代码：existsSync 门跳过扫描 → 进度整体归零）",
+	);
+	assert.equal(after.lastAuditedId, "D-011", "本次 patch 字段仍优先");
+});
+
+test("R3-F6: 非法 signature.status 丢弃签名（fail-closed，防门禁误开）", () => {
+	const dir = tmpDir();
+	const file = auditStatePath(dir);
+	fs.mkdirSync(path.dirname(file), { recursive: true });
+	// LLM 写垃圾 status（数字/拼写错误）——旧代码只查 !== undefined → 通过消毒，
+	// isAuditCompleted 视非 failed 为完成 → 门禁误开且 blockers 静默丢失
+	fs.writeFileSync(
+		file,
+		JSON.stringify({
+			signature: { status: 42, at: Date.now() + 1000, runId: "r1", blockers: ["x"] },
+		}),
+		"utf-8",
+	);
+	const st = readAuditState(dir);
+	assert.equal(st.signature, null, "非法 status 的签名必须丢弃（fail-closed）");
 });
