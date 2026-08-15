@@ -2109,10 +2109,11 @@ test("shouldInjectSignatureFindings：结论注入判据 + 新鲜度校验（v1.
 	);
 });
 
-test("shouldClearStaleLock：残留锁兜底判据（v1.0.21 行为级）", () => {
+test("shouldClearStaleLock：残留锁兜底判据（v1.0.21 行为级 + R5-F3 契约）", () => {
 	const base = {
 		...readAuditState(tmpDir()),
 		inFlight: true,
+		auditStartedAt: Date.now() - IN_FLIGHT_TTL_MS - 1000, // 超 TTL = 审计不可能还活着
 	};
 	// 文件锁在 + 内存锁无（审计者被强杀未写收尾）→ 清锁
 	assert.equal(shouldClearStaleLock(base, false), true);
@@ -2126,6 +2127,11 @@ test("shouldClearStaleLock：残留锁兜底判据（v1.0.21 行为级）", () =
 	// 纯咨询轮（无任何 work 信号）→ 判据与 hasWork 无关，残留锁仍清——
 	// 位置语义（先于 hasWork return）由接线守卫 indexOf 顺序断言锁定
 	assert.equal(shouldClearStaleLock(base, false), true);
+	// R5-F3：auditStartedAt=0（年龄未知）→ 保守不清（真在跑的审计被清会并发双审计）
+	assert.equal(
+		shouldClearStaleLock({ ...readAuditState(tmpDir()), inFlight: true }, false),
+		false,
+	);
 });
 
 test("gitHead：交付门禁的客观信号（HEAD 变化）", () => {
@@ -3277,5 +3283,114 @@ test("R4-F6: convlogForeignRuns 的 Task: 排除按内容前缀（子串匹配�
 		convlogForeignRuns(dir, "run-a"),
 		1,
 		"含 Task: 子串的真实用户消息必须计数（旧代码：子串匹配整行 → 被豁免 → 多实例守卫失效）",
+	);
+});
+
+// ===== R5 对抗性审计回归（5 轮审计第 5 轮：注入/签名/杂项）=====
+
+test("R5-F1: at=0 签名不得作为注入去重键（0 = 缺失，跨 run 撞键）", () => {
+	const base = { ...readAuditState(tmpDir()), auditRunId: "run-A" };
+	// B5 兜底路径：审计者手写签名漏 at → 消毒为 0
+	const sig = { status: "blocked" as const, at: 0, blockers: ["X"], head: "h1" };
+	// 首条 at=0：注入
+	assert.equal(
+		shouldInjectSignatureFindings({ ...base, signature: sig }, undefined, "h1"),
+		true,
+		"首条 at=0 注入",
+	);
+	// 第二条 at=0（新 run 同 head）：旧代码 injectedAt=0 === at=0 → 判已注入 → 结论静默吞
+	assert.equal(
+		shouldInjectSignatureFindings({ ...base, signature: sig }, 0, "h1"),
+		true,
+		"at=0 不得作为去重键（0 = 缺失时间戳；旧代码：0===0 撞键 → blockers 永不注入）",
+	);
+	// 正常 at>0 去重仍生效
+	const sig2 = { ...sig, at: 12345 };
+	assert.equal(
+		shouldInjectSignatureFindings({ ...base, signature: sig2 }, 12345, "h1"),
+		false,
+		"at>0 去重键不变",
+	);
+});
+
+test("R5-F2: 缺 runId 签名不得靠时钟容差满足本轮门禁", () => {
+	const base = { ...readAuditState(tmpDir()), auditRunId: "run-B", inFlight: false };
+	// 前轮签名（60s 前完成，在 5min 容差内，漏写 runId）——兼容路径无身份可校验
+	const stale = {
+		...base,
+		signature: {
+			status: "blocked" as const,
+			at: Date.now() - 60_000,
+			blockers: ["X"],
+			head: "h",
+		},
+	};
+	assert.equal(
+		isAuditCompleted(stale, Date.now()),
+		false,
+		"缺 runId + 容差窗口内旧签名不得放行（旧代码：容差吸收 + runId 缺失兼容 → 前轮结论劫持本轮门禁）",
+	);
+});
+
+test("R5-F3: auditStartedAt=0（年龄未知）不得清锁", () => {
+	const st = { ...readAuditState(tmpDir()), inFlight: true, auditStartedAt: 0 };
+	assert.equal(
+		shouldClearStaleLock(st, false),
+		false,
+		"年龄未知（0）→ 保守不清（旧代码：0 视为足够旧 → 活锁被清 → 并发双审计）",
+	);
+	// 超 TTL 仍清（不回归）
+	const old = {
+		...readAuditState(tmpDir()),
+		inFlight: true,
+		auditStartedAt: Date.now() - IN_FLIGHT_TTL_MS - 1000,
+	};
+	assert.equal(shouldClearStaleLock(old, false), true, "超 TTL 清锁不回归");
+});
+
+test("R5-F4: 负 convExtractedLine 钳制到 0（防 hasNewConversation 恒真）", () => {
+	const dir = tmpDir();
+	writeAuditState(dir, { ...readAuditState(dir), convExtractedLine: -5 });
+	assert.equal(clampConvExtractedLine(dir), 0, "负游标钳制到 0");
+	assert.equal(
+		hasNewConversation(dir, 0),
+		false,
+		"负游标不触发恒真 spawn（旧代码：clamp 放行负值 → count > -5 恒真 → 纯咨询轮每轮 spawn）",
+	);
+});
+
+test("R5-F5: appendGeneralization 字段含 | 分隔符词组不错位", () => {
+	const dir = tmpDir();
+	appendGeneralization(dir, [
+		{ scene: "S", path: "P", source: "审计 | 来源: R" },
+	]);
+	const gs = readGeneralizations(dir);
+	assert.equal(gs.length, 1);
+	assert.equal(
+		gs[0].source,
+		"审计 来源: R",
+		"来源字段含 | 分隔符词组不得错位（旧代码：整行解析 → path 被污染为 'P | 来源: 审计'）",
+	);
+	assert.equal(gs[0].path, "P");
+	assert.equal(gs[0].scene, "S");
+});
+
+test("R5-F6: B5 兜底分支（at=0 + lastAuditAt）同享时钟容差", () => {
+	const base = { ...readAuditState(tmpDir()), auditRunId: "run-B", inFlight: false };
+	// runId 匹配（身份可校验）→ at=0 走 B5：lastAuditAt 在容差内（慢钟主机 3min）
+	const st = {
+		...base,
+		lastAuditAt: Date.now() - 3 * 60_000,
+		signature: {
+			status: "blocked" as const,
+			at: 0,
+			blockers: ["X"],
+			runId: "run-B",
+		},
+	};
+	assert.equal(
+		isAuditCompleted(st, Date.now()),
+		true,
+		"B5 分支同享容差（旧代码：严格比较 → 慢钟主机假超时 → 300s 降级覆盖真实结论）",
 	);
 });

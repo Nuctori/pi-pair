@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.0.82] - 2026-08-15
+
+5 轮独立 subagent 对抗性审计第 5 轮（注入/签名/杂项，reviewer fresh 只读）——5 轮审计全部完成：
+
+- **at=0 签名跨 run 撞去重键（medium）**：B5 兜底路径（审计者手写漏 at → 消毒为 0）下 `injectedAt === sig.at` 的 0===0 恒真 → 第二条 at=0 签名的 blockers 永不注入（结论静默吞）。修复：lib 去重仅 at>0 参与 + 扩展全部落盘点（持久化 ×4 + 内存 map ×4 + async-complete ×1）`?? Date.now()` 改 `|| Date.now()`（`??` 对非空 number 是死代码，at=0 原样落盘）。测试：R5-F1。
+- **缺 runId 签名靠时钟容差劫持门禁（medium）**：兼容路径（auditRunId 在、sig.runId 缺）无身份可校验，LC-06 的 5min 容差把前轮残留签名（5min 内完成）误满足本轮完成判定 → 未审提交被旧结论放行。修复：缺 runId 时主路径与 B5 分支均严格比较（不容差），身份可校验才享容差。测试：R5-F2（前轮 60s 签名不放行）。
+- **auditStartedAt=0 无条件清锁（low）**：年龄守卫短路为不过滤 → inFlight=true + 年龄未知（LLM 覆盖写丢字段/legacy）→ 活锁被清 → 并发双审计。修复：0 视为过新（不清）；陈旧锁由 resetForSessionStart 兜底。测试：R5-F3 + 既有测试契约更新。
+- **负 convExtractedLine 恒真触发（low）**：clamp 只钳上界，负值（损坏 state）→ hasNewConversation 恒真 → 纯咨询轮每轮 spawn。修复：同时钳下界到 0。测试：R5-F4。
+- **appendGeneralization 字段含 ` | ` 错位分裂（low）**：FINDING_RE 贪心解析下字段含 ` | 来源: ` 等分隔符词组 → path/场景被污染（frequentPaths 聚合失真）。修复：写入侧剥离竖线（标签字段语义无损）。测试：R5-F5。
+- **B5 兜底分支无时钟容差（low）**：at=0 + lastAuditAt 严格比较，与主路径 LC-06 容差不一致 → 跨主机慢钟假超时 → 300s 降级覆盖真实 blocked 结论。修复：身份可校验时 B5 同享容差（随 F2 的 grace 重构一并实现）。测试：R5-F6。
+- 验证：95/95 通过（+6 R5 测试 + 1 契约更新），tsc 0。
+
 ## [1.0.81] - 2026-08-15
 
 5 轮独立 subagent 对抗性审计第 4 轮（convlog 路径，reviewer fresh 只读）：

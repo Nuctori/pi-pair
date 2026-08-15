@@ -795,10 +795,13 @@ export function appendGeneralization(
 		fs.writeFileSync(file, GAPS_HEADER, "utf-8");
 	}
 	// R2-F4（appendGeneralization 孪生）：截断不劈开 surrogate pair
+	// R5-F5：字段内容含 ` | `（含 ` | 来源: ` 等分隔符词组）会被 FINDING_RE 贪心解析
+	// 错位分裂（path/场景被污染）→ 写入侧剥离竖线（标签字段，语义无损）
 	const clean = (s: string, max: number): string =>
 		s
 			.replace(/\r?\n/g, " ")
 			.replace(/\s+/g, " ")
+			.replace(/\s*\|\s*/g, " ")
 			.trim()
 			.slice(0, max)
 			.replace(/[\uD800-\uDBFF]$/, "");
@@ -1625,7 +1628,11 @@ export function hasNewConversation(
 export function clampConvExtractedLine(cwd: string): number {
 	const total = convLogLineCount(cwd);
 	const state = readAuditState(cwd);
-	return state.convExtractedLine > total ? total : state.convExtractedLine;
+	// R5-F4：同时钳下界——负值（损坏/手写 state）会让 hasNewConversation 恒真
+	// （count > 负数），纯咨询轮每轮 spawn 审计者
+	return state.convExtractedLine > total
+		? total
+		: Math.max(0, state.convExtractedLine);
 }
 
 /** 纯咨询轮审计者写入的 findings 占位——不算真实中间态（跨会话注入过滤用，防零注入承诺被打破）。 */
@@ -1658,7 +1665,9 @@ export function shouldInjectInterimFindings(
 	state: AuditState,
 	injectedAt: number | undefined,
 ): boolean {
-	if (state.auditFindings.length === 0 || injectedAt === state.auditStartedAt) {
+	if (state.auditFindings.length === 0) return false;
+	// R5-F1（中间态孪生）：auditStartedAt=0（legacy）不是合法去重键——0 === 0 撞键
+	if (state.auditStartedAt !== 0 && injectedAt === state.auditStartedAt) {
 		return false;
 	}
 	const hasReal = state.auditFindings.some((f) => !isPlaceholderFinding(f));
@@ -1690,9 +1699,14 @@ export function isAuditCompleted(
 	// Date.now 写入——网络盘双机共享 state.json 时跨主机时钟偏移破坏 at 序关系（慢钟机签名
 	// at < 快钟机 auditStartedAt → 门禁永不完成 300s 假超时）。加容差吸收偏移 + 同机 NTP 抖动；
 	// runId 身份校验仍独立把关（容差不放行他 run 的签名）。
+	// R5-F2/F6：兼容路径（auditRunId 存在但签名缺 runId）无身份可校验——容差窗口内
+	// 前轮残留签名会误满足本轮门禁（5min 内完成的前轮签名劫持）。收紧：缺 runId 时
+	// 主路径与 B5 分支均严格比较（不容差）；身份可校验（runId 匹配）才享 LC-06 容差。
+	const noIdentity = !!state.auditRunId && !sig.runId;
+	const grace = noIdentity ? 0 : CLOCK_SKEW_GRACE_MS;
 	const atOk =
-		sig.at >= startedAt - CLOCK_SKEW_GRACE_MS ||
-		(sig.at === 0 && state.lastAuditAt >= startedAt);
+		sig.at >= startedAt - grace ||
+		(sig.at === 0 && state.lastAuditAt >= startedAt - grace);
 	if (!atOk || state.inFlight) return false;
 	if (state.auditRunId && sig.runId && sig.runId !== state.auditRunId) {
 		return false; // 签名属于其他 spawn 的审计者
@@ -1722,7 +1736,10 @@ export function shouldInjectSignatureFindings(
 		return false;
 	}
 	if (!sig.blockers || sig.blockers.length === 0) return false;
-	if (injectedAt === sig.at) return false;
+	// R5-F1：at=0（审计者漏写，B5 消毒路径）不是合法去重键——0 === 0 跨 run 撞键
+	// 会吞掉第二条 at=0 签名的 blockers。仅 at>0 参与去重（调用方落盘时以
+	// `at || Date.now()` 持久化真实时间戳，双重防护）。
+	if (sig.at !== 0 && injectedAt === sig.at) return false;
 	// 新鲜度：签名基于的 HEAD 与当前一致才注入；无法校验（head 缺失）→ 兼容注入
 	if (sig.head !== undefined && sig.head !== null && currentHead !== sig.head) {
 		return false;
@@ -1745,7 +1762,10 @@ export function shouldClearStaleLock(
 	now: number = Date.now(),
 ): boolean {
 	const auditTooRecent =
-		state.auditStartedAt > 0 && now - state.auditStartedAt < IN_FLIGHT_TTL_MS;
+		// R5-F3：auditStartedAt=0（LLM 覆盖写丢字段/legacy）年龄未知 → 保守视为过新
+		// （不清锁——真在跑的审计被清会并发双审计；陈旧锁由 resetForSessionStart 兜底）
+		state.auditStartedAt === 0 ||
+		(state.auditStartedAt > 0 && now - state.auditStartedAt < IN_FLIGHT_TTL_MS);
 	return state.inFlight === true && !hasInMemoryLock && !auditTooRecent;
 }
 

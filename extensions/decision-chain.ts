@@ -1360,11 +1360,11 @@ export default function (pi: ExtensionAPI): void {
 						if (
 							!patchAuditState(root, {
 								injectedSignatureAt: sigTriggered
-									? (state.signature!.at ?? Date.now())
+									? (state.signature!.at || Date.now()) // R5-F1：at=0（审计者漏写）用当前时间持久化，防 0 撞键
 									: (injectedSignatureAt.get(root) ??
 										state.injectedSignatureAt),
 								injectedInterimAt: interimTriggered
-									? (state.auditStartedAt ?? Date.now())
+									? (state.auditStartedAt || Date.now()) // R5-F1（中间态孪生）：auditStartedAt=0 防 0 撞键
 									: (injectedInterimAt.get(root) ?? state.injectedInterimAt),
 							})
 						) {
@@ -1375,10 +1375,10 @@ export default function (pi: ExtensionAPI): void {
 					}
 					// F8：patch 成功后才 set 内存（失败则保持未置位，同会话下轮可重试）
 					if (sigTriggered) {
-						injectedSignatureAt.set(root, state.signature!.at ?? Date.now());
+						injectedSignatureAt.set(root, state.signature!.at || Date.now()); // R5-F1：at=0 用当前时间，防 0 撞键
 					}
 					if (interimTriggered) {
-						injectedInterimAt.set(root, state.auditStartedAt ?? Date.now());
+						injectedInterimAt.set(root, state.auditStartedAt || Date.now()); // R5-F1（中间态孪生）
 					}
 					return; // 跨会话：不注入对话（D-036）
 				}
@@ -1389,10 +1389,10 @@ export default function (pi: ExtensionAPI): void {
 							// `?? null` 会把已持久化的 injectedSignatureAt 覆写为 null →
 							// 跨会话去重失效重注入。回退到 state 持久化值（非 null 清空）
 							injectedSignatureAt: sigTriggered
-								? (state.signature!.at ?? Date.now())
+								? (state.signature!.at || Date.now()) // R5-F1：at=0（审计者漏写）用当前时间持久化，防 0 撞键
 								: (injectedSignatureAt.get(root) ?? state.injectedSignatureAt),
 							injectedInterimAt: interimTriggered
-								? (state.auditStartedAt ?? Date.now())
+								? (state.auditStartedAt || Date.now()) // R5-F1（中间态孪生）：auditStartedAt=0 防 0 撞键
 								: (injectedInterimAt.get(root) ?? state.injectedInterimAt),
 						})
 					) {
@@ -1403,10 +1403,10 @@ export default function (pi: ExtensionAPI): void {
 				}
 				// F8：patch 成功后才 set 内存（失败则保持未置位，同会话下轮可重试）
 				if (sigTriggered) {
-					injectedSignatureAt.set(root, state.signature!.at ?? Date.now());
+					injectedSignatureAt.set(root, state.signature!.at || Date.now()); // R5-F1：at=0 用当前时间，防 0 撞键
 				}
 				if (interimTriggered) {
-					injectedInterimAt.set(root, state.auditStartedAt ?? Date.now());
+					injectedInterimAt.set(root, state.auditStartedAt || Date.now()); // R5-F1（中间态孪生）
 				}
 				return {
 					message: {
@@ -2099,7 +2099,7 @@ export default function (pi: ExtensionAPI): void {
 					}
 					// followUp 已交付 → 记录跨会话去重（v1.0.25：避免新会话 before_agent_start
 					// 再次注入同一签名——「新会话还有泄露」根治；v1.0.28：持久化已前置；v1.0.29：交付成功后才落盘）
-					injectedSignatureAt.set(completedCwd, st.signature.at ?? Date.now());
+					injectedSignatureAt.set(completedCwd, st.signature.at || Date.now()); // R5-F1：at=0 用当前时间，防 0 撞键
 				}
 			} catch {
 				/* noop */
