@@ -2899,3 +2899,174 @@ test("R1-F6: cleanField 截断不切开 surrogate pair", () => {
 // 修复：去掉 `expectedMtime !== null &&` 守卫 → 复校验无条件执行，漏检需
 // 「捕获 stat 失败 + 复校验 stat 也失败（null===null）+ 其间并发写者」三重条件。
 // 由代码审查 + 本注释守护。
+
+// ===== R2 对抗性审计回归（5 轮审计第 2 轮：audit-log/backfill/clamp 路径）=====
+
+test("R2-F1a: readAuditLog 非 ENOENT 读错误必须抛错（防 [] 触发补写覆盖整条日志）", () => {
+	const dir = tmpDir();
+	appendAuditReport(dir, {
+		verdict: "passed",
+		head: "abc",
+		window: "w",
+		blockers: [],
+		runId: "r",
+		body: "b",
+	});
+	// audit-log.md 原位替换为同名目录 → EISDIR（非 ENOENT 读失败）
+	const file = auditLogPath(dir);
+	fs.rmSync(file);
+	fs.mkdirSync(file);
+	assert.throws(
+		() => readAuditLog(dir),
+		"读错误必须外抛（旧代码：catch-all 返回 [] → backfill 判定真 → 补写覆盖整条日志）",
+	);
+	// 真缺失（ENOENT）仍返回空数组——不回归
+	const dir2 = tmpDir();
+	assert.deepEqual(readAuditLog(dir2), []);
+});
+
+test("R2-F1b: appendAuditReport 非 ENOENT 读错误不得静默覆盖整条日志（EISDIR 实证）", () => {
+	const dir = tmpDir();
+	appendAuditReport(dir, {
+		verdict: "passed",
+		head: "abc",
+		window: "w",
+		blockers: [],
+		runId: "r",
+		body: "b",
+	});
+	const file = auditLogPath(dir);
+	fs.rmSync(file);
+	fs.mkdirSync(file);
+	assert.throws(
+		() =>
+			appendAuditReport(dir, {
+				verdict: "blocked",
+				head: "abc",
+				window: "w",
+				blockers: ["x"],
+				runId: "r",
+				body: "b",
+			}),
+		(e: unknown) => !String((e as Error).message).includes("并发冲突"),
+		"读错误必须直接外抛（旧代码：吞错→按空日志编号→rename 失败 3 次→笼统冲突）",
+	);
+});
+
+test("R2-F3: 正文含 `## AUDIT-` 引用行不产生幻影条目、不导致写失败", () => {
+	const dir = tmpDir();
+	const id = appendAuditReport(dir, {
+		verdict: "passed",
+		head: "abc",
+		window: "w",
+		blockers: [],
+		runId: "r",
+		body: "正文开始\n## AUDIT-999: 引用旧条目\n正文结尾",
+	});
+	assert.ok(id.startsWith("AUDIT-"), "写成功（旧代码：幻影条目使末尾校验失败→3 次重试→抛冲突）");
+	const entries = readAuditLog(dir);
+	assert.equal(entries.length, 1, "正文中的 ## AUDIT- 行不得被解析为幻影条目");
+	assert.ok(entries[0].body.includes("AUDIT-999"), "引用内容保留（转义而非删除）");
+	assert.ok(
+		entries[0].body.includes("<!-- ## AUDIT-999"),
+		"引用行已转义为 HTML 注释（行首不再匹配条目头）",
+	);
+	assert.ok(
+		!/^## AUDIT-\d+: /m.test(entries[0].body),
+		"正文中不得残留可匹配条目头的行",
+	);
+});
+
+test("R2-F4: appendAuditReport 字段截断不劈开 surrogate pair", () => {
+	const dir = tmpDir();
+	// "a" + 🚀×500 = 1001 units > 1000（Blockers 上限）→ slice(0,1000) 切进第 500 个 🚀 的配对中间
+	appendAuditReport(dir, {
+		verdict: "blocked",
+		head: "abc",
+		window: "w",
+		blockers: ["a" + "🚀".repeat(500)],
+		runId: "r",
+		body: "b",
+	});
+	const raw = fs.readFileSync(auditLogPath(dir), "utf-8");
+	const stripped = raw.replace(/[\uD800-\uDBFF][\uDC00-\uDFFF]/g, "");
+	assert.ok(
+		!/[\uD800-\uDBFF\uDC00-\uDFFF]/.test(stripped),
+		"截断后不得残留孤立代理（WTF-8 往返保留孤立代理，会污染证明链）",
+	);
+});
+
+test("R2-F5: 不可解析日期不静默视为已审（NaN 比较保守方向）", () => {
+	const dir = tmpDir();
+	const chainFile = chainPath(dir);
+	fs.mkdirSync(path.dirname(chainFile), { recursive: true });
+	fs.writeFileSync(
+		chainFile,
+		`# Decision Chain
+
+## D-001: old [Accepted]
+- Context: c
+- Date: 2024-01-01T00:00:00.000Z
+
+## D-002: bad-date [Accepted]
+- Context: c
+- Date: 不是日期
+
+`,
+		"utf-8",
+	);
+	appendAuditReport(dir, {
+		verdict: "passed",
+		head: "abc",
+		window: "w",
+		blockers: [],
+		runId: "r",
+		body: "b",
+	});
+	// 最新审计 Date 是现在（2026）→ D-001 已审；D-002 日期不可解析：
+	// NaN > x 恒 false → 旧代码静默视为已审（缺口被吞）；必须保守报未审
+	const ids = queryGaps(dir).proofGaps.unreviewedDecisions.map((d) => d.id);
+	assert.ok(ids.includes("D-002"), "不可解析日期必须保守报未审（不得静默隐藏缺口）");
+	assert.ok(!ids.includes("D-001"), "合法旧日期仍为已审");
+});
+
+test("R2-F6: backfill 条目 Date 用签名 at（非补写时刻）", () => {
+	const dir = tmpDir();
+	const at = new Date("2024-05-01T00:00:00.000Z").getTime();
+	writeAuditState(dir, {
+		...readAuditState(dir),
+		auditRunId: "r1",
+		signature: { status: "passed", at, runId: "r1" },
+	});
+	assert.equal(backfillAuditLogIfNeeded(dir), true, "补写发生");
+	const entries = readAuditLog(dir);
+	assert.equal(entries.length, 1);
+	assert.equal(
+		entries[0].date,
+		new Date(at).toISOString(),
+		"补写日期 = 签名 at（实际审计完成时刻）；旧代码用补写时刻（now）→ 掩盖 at 与补写间的新决策",
+	);
+});
+
+test("R2-F8: runId 与 head 均空时不得每轮重复补写（无身份锚）", () => {
+	const dir = tmpDir();
+	appendAuditReport(dir, {
+		verdict: "passed",
+		head: "",
+		window: "w",
+		blockers: [],
+		runId: "",
+		body: "b",
+	});
+	writeAuditState(dir, {
+		...readAuditState(dir),
+		auditRunId: "",
+		signature: { status: "passed", at: Date.now() - 1000 },
+	});
+	assert.equal(
+		backfillAuditLogIfNeeded(dir),
+		false,
+		"runId/head 均空（git 失败+无 runId）→ 无可锚定身份，不得补写（旧代码：每轮补写→无界增长）",
+	);
+	assert.equal(readAuditLog(dir).length, 1, "日志不增长");
+});

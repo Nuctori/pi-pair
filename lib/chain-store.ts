@@ -325,12 +325,14 @@ export function ensureAuditLog(cwd: string): string {
 	return file;
 }
 
-/** 读 audit-log.md 原文；缺失视为仅头注释。 */
+/** 读 audit-log.md 原文；缺失（ENOENT）视为仅头注释，其他读错误抛错
+ *  R2-F1：把 EBUSY/EIO 当缺失 → backfill 按空日志判定真 → rename 覆盖整条证明链。 */
 function readRawAuditLog(file: string): string {
 	try {
 		return fs.readFileSync(file, "utf-8");
-	} catch {
-		return AUDIT_LOG_HEADER;
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return AUDIT_LOG_HEADER;
+		throw e;
 	}
 }
 
@@ -352,8 +354,14 @@ export function appendAuditReport(
 	now: Date = new Date(),
 ): string {
 	const file = ensureAuditLog(cwd);
+	// R2-F4：截断按 UTF-16 码元 slice 可切开 surrogate pair（尾部孤立高代理）→ 剥离
 	const clean = (s: string, max: number): string =>
-		s.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+		s
+			.replace(/\r?\n/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, max)
+			.replace(/[\uD800-\uDBFF]$/, "");
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const expectedMtime = auditLogMtime(file);
 		const raw = readRawAuditLog(file);
@@ -368,12 +376,20 @@ export function appendAuditReport(
 			`- Date: ${now.toISOString()}`,
 			"",
 		];
-		// 正文原样多行（审计输出可读性）；验证只认 `## AUDIT-` 行，不受正文影响
-		const payload = `${raw.replace(/\r?\n$/, "")}\n\n${lines.join("\n")}${fields.body}\n`;
+		// 正文原样多行（审计输出可读性）；验证只认 `## AUDIT-` 行，不受正文影响。
+		// R2-F3：正文行若以 `## AUDIT-<digits>:` 开头（审计者引用旧条目 id），
+		// 解析侧按条目头分裂出幻影条目 + 写后验证被幻影顶掉末尾 → 3 次重试仍失败
+		// （证明链空洞）。转义为 HTML 注释行，内容保留但不再匹配条目头。
+		const escapedBody = fields.body
+			.split("\n")
+			.map((l) => (/^## AUDIT-\d+: /.test(l) ? `<!-- ${l} -->` : l))
+			.join("\n");
+		const payload = `${raw.replace(/\r?\n$/, "")}\n\n${lines.join("\n")}${escapedBody}\n`;
 		const tmp = `${file}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		try {
 			fs.writeFileSync(tmp, payload, "utf-8");
-			if (expectedMtime !== null && auditLogMtime(file) !== expectedMtime) {
+			// R2-F2：expectedMtime=null（stat 瞬时失败）时不得跳过复校验（同 R1-F7）
+			if (auditLogMtime(file) !== expectedMtime) {
 				try {
 					fs.unlinkSync(tmp);
 				} catch {
@@ -479,12 +495,13 @@ export function parseAuditLog(raw: string): AuditLogEntry[] {
 	return out;
 }
 
-/** 读 audit-log 并解析条目；缺失/损坏返回空数组。 */
+/** 读 audit-log 并解析条目；缺失（ENOENT）返回空数组，其他读错误抛错（R2-F1 同源）。 */
 export function readAuditLog(cwd: string): AuditLogEntry[] {
 	try {
 		return parseAuditLog(fs.readFileSync(auditLogPath(cwd), "utf-8"));
-	} catch {
-		return [];
+	} catch (e) {
+		if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return [];
+		throw e;
 	}
 }
 
@@ -505,6 +522,9 @@ export function shouldBackfillAuditLog(
 	sigBlockers: string[],
 ): boolean {
 	if (entries.length === 0) return true; // 从未落盘 → 补写
+	// R2-F8：runId 与 head 均空（git 失败 + 无 auditRunId）→ 无可锚定身份，
+	// 匹配分支全死 → 恒真 → 每轮重复补写（audit-log 无界增长）。跳过。
+	if (!sigRunId && !sigHead) return false;
 	const headMatch = (h: string): boolean =>
 		!!sigHead &&
 		!!h && // v1.0.68：空 head 条目不得匹配任意签名（startsWith("") 恒真毒化）
@@ -579,15 +599,21 @@ export function backfillAuditLogIfNeeded(
 	) {
 		return false; // 已有该签名条目（含回填/正常落盘）
 	}
-	appendAuditReport(cwd, {
-		verdict: sig.status === "blocked" ? "blocked" : "passed",
-		head: sig.head ?? "",
-		window: "（豁免补写：audit-log ≥30KB 审计者未落盘，扩展原子补写元数据）",
-		blockers,
-		// v1.0.64：runId 与判定同源（sig.runId ?? auditRunId）——幂等匹配的基础
-		runId: sigRunId,
-		body: "扩展补写元数据条目（审计结论见 state.json signature/blockers，泛化发现在 gaps.md）。",
-	});
+	appendAuditReport(
+		cwd,
+		{
+			verdict: sig.status === "blocked" ? "blocked" : "passed",
+			head: sig.head ?? "",
+			window: "（豁免补写：audit-log ≥30KB 审计者未落盘，扩展原子补写元数据）",
+			blockers,
+			// v1.0.64：runId 与判定同源（sig.runId ?? auditRunId）——幂等匹配的基础
+			runId: sigRunId,
+			body: "扩展补写元数据条目（审计结论见 state.json signature/blockers，泛化发现在 gaps.md）。",
+		},
+		// R2-F6：补写日期 = 签名 at（实际审计完成时刻）——用补写时刻 now 会
+		// 掩盖 at 与补写之间的新决策（被误判已审）
+		sig.at ? new Date(sig.at) : undefined,
+	);
 	return true;
 }
 
@@ -660,12 +686,18 @@ export function queryGaps(
 	const unreviewedDecisions = latest
 		? chainEntries
 				.filter(
-					(e) =>
-						e.date &&
+					(e) => {
+						if (!e.date) return false;
 						// 时区混合比较（reviewer Medium-1）：chain.md 审计者手写为本地时区
 						// （`+08:00`），audit-log 为 toISOString UTC（`Z`）——字符串比较
 						// 把本地小时当 UTC 比，已审决策被误报未审。统一转 epoch ms。
-						new Date(e.date).getTime() > new Date(latest.date).getTime(),
+						const d = new Date(e.date).getTime();
+						const l = new Date(latest.date).getTime();
+						// R2-F5：手写/损坏日期解析为 NaN 时，NaN > x 恒 false → 静默视为
+						// 已审（缺口被吞）。保守方向：不可解析 → 报未审（宁多报不隐藏）。
+						if (!Number.isFinite(d) || !Number.isFinite(l)) return true;
+						return d > l;
+					},
 				)
 				.map((e) => ({ id: e.id, summary: e.summary, date: e.date }))
 		: chainEntries.map((e) => ({ id: e.id, summary: e.summary, date: e.date }));
@@ -762,15 +794,23 @@ export function appendGeneralization(
 		fs.mkdirSync(path.dirname(file), { recursive: true });
 		fs.writeFileSync(file, GAPS_HEADER, "utf-8");
 	}
+	// R2-F4（appendGeneralization 孪生）：截断不劈开 surrogate pair
 	const clean = (s: string, max: number): string =>
-		s.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim().slice(0, max);
+		s
+			.replace(/\r?\n/g, " ")
+			.replace(/\s+/g, " ")
+			.trim()
+			.slice(0, max)
+			.replace(/[\uD800-\uDBFF]$/, "");
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const expectedMtime = auditLogMtime(file);
 		let raw: string;
 		try {
 			raw = fs.readFileSync(file, "utf-8");
-		} catch {
-			raw = GAPS_HEADER;
+		} catch (e) {
+			// R2-F1（appendGeneralization 孪生）：仅 ENOENT 视为空，其余读错误抛错
+			if ((e as NodeJS.ErrnoException)?.code === "ENOENT") raw = GAPS_HEADER;
+			else throw e;
 		}
 		const lines = findings.map(
 			(f) =>
@@ -780,7 +820,8 @@ export function appendGeneralization(
 		const tmp = `${file}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		try {
 			fs.writeFileSync(tmp, payload, "utf-8");
-			if (expectedMtime !== null && auditLogMtime(file) !== expectedMtime) {
+			// R2-F2：expectedMtime=null（stat 瞬时失败）时不得跳过复校验（同 R1-F7）
+			if (auditLogMtime(file) !== expectedMtime) {
 				try {
 					fs.unlinkSync(tmp);
 				} catch {

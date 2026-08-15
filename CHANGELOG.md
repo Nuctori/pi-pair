@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.0.79] - 2026-08-15
+
+5 轮独立 subagent 对抗性审计第 2 轮（audit-log/backfill/clamp/queryGaps 路径，reviewer fresh 只读）：
+
+- **readRawAuditLog/readAuditLog 吞非 ENOENT 读错误（high）**：R1-F1 同源缺陷仍在 audit-log 路径——catch-all 把 EBUSY/EIO 当缺失 → before_agent_start 轮询读到 [] → shouldBackfillAuditLog 恒真 → appendAuditReport 按空日志编号、rename 覆盖整条证明链（mtime 复校验通过、verify 通过）。修复：readRawAuditLog（仅 ENOENT 视为头）、readAuditLog（仅 ENOENT 返回 []）、appendGeneralization 读（孪生，仅 ENOENT 视为空）其余抛错。测试：EISDIR 实证 ×2 + ENOENT 不回归。
+- **appendAuditReport/appendGeneralization expectedMtime=null 跳过复校验（medium）**：R1-F7 同型守卫仍在两处。修复：去掉 null 守卫（与 R1-F7 同理由，瞬时 stat 失败不可注入，文档化）。
+- **正文 `## AUDIT-` 引用行 → 幻影条目 + 写失败（medium）**：审计者正文引用旧条目 id（`## AUDIT-<digits>:` 行）→ 解析侧按条目头分裂幻影条目（queryGaps latest 变垃圾）+ 写后「末尾条目」校验被幻影顶掉 → 3 次重试仍失败、证明链空洞且文件被重复污染。修复：写入侧把正文中匹配条目头的行转义为 HTML 注释（内容保留）。测试：引用行写成功、解析 1 条、行首不再匹配条目头。
+- **appendAuditReport/appendGeneralization 截断劈开 surrogate pair（low）**：R1-F6 同型（clean 无代理对保护）。修复 + 测试（奇数偏移 blockers）。
+- **queryGaps NaN 日期比较（low）**：手写/损坏日期 `new Date().getTime()` = NaN，`NaN > x` 恒 false → 静默视为已审（缺口被吞）。修复：不可解析日期保守报未审（宁多报不隐藏）。测试：垃圾日期必现于 unreviewedDecisions。
+- **backfill 条目 Date 用补写时刻（low）**：掩盖签名 at 与补写之间的新决策（误判已审）。修复：`appendAuditReport(..., new Date(sig.at))`。测试：补写条目 date = 签名 at。
+- **runId 与 head 均空 → 每轮重复补写（low）**：git 失败 + 无 auditRunId 时匹配分支全死 → shouldBackfillAuditLog 恒真 → audit-log 无界增长。修复：无可锚定身份时返回 false。测试：两次调用不增长。
+- **F7 判定为非问题**：recentFindings 被 gaps.md 主导是设计（gaps.md v1.0.60 起为 canonical 源，audit-log findings 为迁移前兼容数据），不修。
+- 验证：79/79 通过（+7 R2 测试），tsc 0。
+
 ## [1.0.78] - 2026-08-15
 
 5 轮独立 subagent 对抗性审计第 1 轮（chain 追加/解析路径，reviewer fresh 只读）：
