@@ -1800,9 +1800,19 @@ export function appendConv(
 	const dir = path.dirname(file);
 	fs.mkdirSync(dir, { recursive: true });
 	if (!fs.existsSync(file)) fs.writeFileSync(file, CONVLOG_HEADER, "utf-8");
-	const clean = text.replace(/\r?\n/g, " ").trim();
+	const clean = text
+		.replace(/\r?\n/g, " ")
+		// R4-F5：裸 \r（无跟随 \n）与 U+2028/U+2029 也是行终止符——不处理则
+		// 审计者 read 工具按通用换行渲染为多行，正文可视觉注入伪造用户行
+		.replace(/[\r\u2028\u2029]/g, " ")
+		.trim();
 	if (!clean) return;
-	const clipped = clean.length > maxLen ? clean.slice(0, maxLen) + "…" : clean;
+	// R4-F3：slice 按 UTF-16 码元截断可劈开 surrogate pair → 尾部孤立高代理被
+	// appendFileSync 编码为 U+FFFD（emoji 静默损坏）→ 先剥离再补省略号
+	const clipped =
+		clean.length > maxLen
+			? clean.slice(0, maxLen).replace(/[\uD800-\uDBFF]$/, "") + "…"
+			: clean;
 	const tag = runId ? ` <!--run:${runId}-->` : "";
 	const line =
 		role === "user"
@@ -1830,24 +1840,42 @@ const TRIM_TARGET_BYTES = MAX_CONVLOG_BYTES / 2;
 function trimConvlog(cwd: string, file: string): void {
 	try {
 		if (fs.statSync(file).size <= MAX_CONVLOG_BYTES) return;
-		const cursor = readAuditState(cwd).convExtractedLine;
+		const rawCursor = readAuditState(cwd).convExtractedLine;
 		const mtime0 = fs.statSync(file).mtimeMs; // 并发保护锚点
 		const raw = fs.readFileSync(file, "utf-8");
+		const lines = raw.split(/\r?\n/);
 		// 对话行判据与 convLogLineCount 一致（## 👤 / ## 🤖）
-		const dialog = raw.split(/\r?\n/).filter((l) => {
+		const dialog = lines.filter((l) => {
 			const t = l.trim();
 			return t.startsWith("## 👤") || t.startsWith("## 🤖");
 		});
-		// 从尾部倒推保留：游标未覆盖行（i ≥ cursor）必须全部保留；已覆盖历史受字节预算约束
+		// R4-F2：游标保守化——审计者可能写文件行号单位（B2 实证失败模式），
+		// 直接当对话行下标会把未读行当已覆盖删除（D-023 硬违反）。取「前 rawCursor
+		// 个文件行内的对话行数」为有效游标：文件行号单位时精确，对话行单位时
+		// 偏保守（少删多留，最多重复读已覆盖行，无丢失）。
+		let effectiveCursor = 0;
+		for (let i = 0; i < Math.min(rawCursor, lines.length); i++) {
+			const t = lines[i].trim();
+			if (t.startsWith("## 👤") || t.startsWith("## 🤖")) effectiveCursor++;
+		}
+		// 从尾部倒推保留：游标未覆盖行（i ≥ effectiveCursor）必须全部保留；
+		// 已覆盖历史受字节预算约束
 		const keep: string[] = [];
 		let bytes = 0;
 		for (let i = dialog.length - 1; i >= 0; i--) {
 			const l = dialog[i];
 			keep.unshift(l);
 			bytes += Buffer.byteLength(l, "utf-8") + 2;
-			if (i < cursor && bytes >= TRIM_TARGET_BYTES) break;
+			if (i < effectiveCursor && bytes >= TRIM_TARGET_BYTES) break;
 		}
 		if (keep.length === dialog.length) return; // 保底即全部 → 不截（防删未提取行）
+		// R4-F1：截断后对话行重编号，旧游标不再指向未提取尾部 → 审计者从新游标起读
+		// 会跳过保留的未提取行（D-023「保留却永不提取」）。重映射：减去被删除的已覆盖
+		// 行数（函数式 patch，基于最新值换算——审计者并发推进游标时同样适用）。
+		const dropped = dialog.length - keep.length;
+		// R4-F7：mtime 复校验移到 rename 紧前（原在 tmp 写前——tmp 写窗口内
+		// 他实例 append 会被 rename 覆盖丢行；FAT 粗粒度下 mtime 不变仍漏检，
+		// 属文件系统极限，注释明示）
 		if (fs.statSync(file).mtimeMs !== mtime0) return; // 并发 append 窗口 → 放弃，下轮再试
 		const tmp = `${file}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 		try {
@@ -1856,6 +1884,10 @@ function trimConvlog(cwd: string, file: string): void {
 				CONVLOG_HEADER + "\n" + keep.join("\n") + "\n",
 				"utf-8",
 			);
+			if (fs.statSync(file).mtimeMs !== mtime0) {
+				fs.unlinkSync(tmp);
+				return; // tmp 写窗口内他实例 append → 放弃（rename 会覆盖丢行）
+			}
 			fs.renameSync(tmp, file);
 		} catch {
 			try {
@@ -1863,6 +1895,17 @@ function trimConvlog(cwd: string, file: string): void {
 			} catch {
 				/* noop */
 			}
+		}
+		// R4-F1：重映射游标到未提取尾部的新位置（dropped 全部是已覆盖行）
+		try {
+			patchAuditState(cwd, (latest) => ({
+				convExtractedLine: Math.max(
+					0,
+					(latest.convExtractedLine ?? rawCursor) - dropped,
+				),
+			}));
+		} catch {
+			/* 游标重映射失败不阻塞截断 */
 		}
 	} catch {
 		/* noop：截断失败不阻塞对话记录 */
@@ -1875,9 +1918,10 @@ export function readConvTail(cwd: string, maxChars = 12000): string {
 		const raw = fs.readFileSync(convlogPath(cwd), "utf-8");
 		if (raw.length <= maxChars) return raw;
 		// 保留头部 + 尾部（头部说明格式，尾部是最近对话）
-		return (
-			raw.slice(0, 200) + "\n\n<!-- 中间省略 -->\n\n" + raw.slice(-maxChars)
-		);
+		// R4-F4：slice 边界可能劈开代理对 → 头部剥离尾部孤立高代理、尾部剥离起始孤立低代理
+		const head = raw.slice(0, 200).replace(/[\uD800-\uDBFF]$/, "");
+		const tail = raw.slice(-maxChars).replace(/^[\uDC00-\uDFFF]/, "");
+		return head + "\n\n<!-- 中间省略 -->\n\n" + tail;
 	} catch {
 		return "（无对话日志）";
 	}
@@ -1951,9 +1995,10 @@ export function readProcess(cwd: string, maxChars = 8000): string {
 	try {
 		const raw = fs.readFileSync(processPath(cwd), "utf-8");
 		if (raw.length <= maxChars) return raw;
-		return (
-			raw.slice(0, 200) + "\n\n<!-- 中间省略 -->\n\n" + raw.slice(-maxChars)
-		);
+		// R4-F4（readProcess 孪生）：slice 边界不劈开代理对
+		const head = raw.slice(0, 200).replace(/[\uD800-\uDBFF]$/, "");
+		const tail = raw.slice(-maxChars).replace(/^[\uDC00-\uDFFF]/, "");
+		return head + "\n\n<!-- 中间省略 -->\n\n" + tail;
 	} catch {
 		return "（无过程日志）";
 	}
@@ -2075,7 +2120,10 @@ export function convlogForeignRuns(cwd: string, ownRunId: string): number {
 			if (!m) continue; // 无标记（旧历史/未升级实例）——无法归属，不误报
 			if (m[1] === ownRunId) continue; // 本实例
 			if (ownPid && m[1].startsWith(`run-${ownPid}-`)) continue; // 同进程其他会话（切会话不算并发）
-			if (t.includes("Task:")) continue; // 审计者任务注入（user-role 记录），非真实会话
+			// R4-F6：Task: 排除收紧为内容前缀——旧代码整行子串匹配，并发实例真实
+			// 消息任意位置含 "Task:" 即被豁免 → 多实例守卫失效（自动审计错审面）。
+			// 注入行形态为 `## 👤 用户: Task: …`（审计任务记录），按内容前缀判定。
+			if (/^## 👤 用户: Task:/.test(t)) continue; // 审计者任务注入（user-role 记录），非真实会话
 			n++;
 		}
 		return n;
