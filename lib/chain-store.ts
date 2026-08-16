@@ -198,12 +198,16 @@ export function appendDecision(
 		// R1-F6：slice 按 UTF-16 码元截断可切开 surrogate pair → 剥离尾部孤立高代理。
 		const cleanField = (s: string, max: number): string => {
 			const t = s.replace(/\r?\n/g, " ").replace(/\s+/g, " ").trim();
-			return t.length > max ? t.slice(0, max).replace(/[\uD800-\uDBFF]$/, "") : t;
+			return t.length > max
+				? t.slice(0, max).replace(/[\uD800-\uDBFF]$/, "")
+				: t;
 		};
 		// R1-F2：supersedes 元素也过消毒（其余字段全消毒唯独这里漏 → \n 注入伪条目）
 		const supersedes =
 			fields.supersedes && fields.supersedes.length > 0
-				? fields.supersedes.map((s) => cleanField(s, 200)).filter((s) => s.length > 0)
+				? fields.supersedes
+						.map((s) => cleanField(s, 200))
+						.filter((s) => s.length > 0)
 				: undefined;
 		const entry: DecisionEntry = {
 			...fields,
@@ -331,7 +335,8 @@ function readRawAuditLog(file: string): string {
 	try {
 		return fs.readFileSync(file, "utf-8");
 	} catch (e) {
-		if ((e as NodeJS.ErrnoException)?.code === "ENOENT") return AUDIT_LOG_HEADER;
+		if ((e as NodeJS.ErrnoException)?.code === "ENOENT")
+			return AUDIT_LOG_HEADER;
 		throw e;
 	}
 }
@@ -631,10 +636,12 @@ export function clampFutureSignatureAt(cwd: string, st?: AuditState): boolean {
 		// v1.0.76（reviewer Low）：函数式重派生 patch（v1.0.28 F-01 模式）——对象 patch
 		// 用早读快照 sig，与审计者并发签名撞 mtime 时重试仍会用旧字段覆盖新签名；
 		// 函数式在锁获取点读最新 state 合并，不覆盖并发写。
-		const ok = patchAuditState(cwd, (latest) =>
-			latest.signature && latest.signature.at > Date.now() + 5 * 60 * 1000
-				? { signature: { ...latest.signature, at: Date.now() } }
-				: null, // 最新快照已非未来（并发钳制/签名完成）→ 放弃
+		const ok = patchAuditState(
+			cwd,
+			(latest) =>
+				latest.signature && latest.signature.at > Date.now() + 5 * 60 * 1000
+					? { signature: { ...latest.signature, at: Date.now() } }
+					: null, // 最新快照已非未来（并发钳制/签名完成）→ 放弃
 		);
 		if (ok) {
 			console.warn(
@@ -685,20 +692,18 @@ export function queryGaps(
 	const chainEntries = parseChain(readRaw(cwd));
 	const unreviewedDecisions = latest
 		? chainEntries
-				.filter(
-					(e) => {
-						if (!e.date) return false;
-						// 时区混合比较（reviewer Medium-1）：chain.md 审计者手写为本地时区
-						// （`+08:00`），audit-log 为 toISOString UTC（`Z`）——字符串比较
-						// 把本地小时当 UTC 比，已审决策被误报未审。统一转 epoch ms。
-						const d = new Date(e.date).getTime();
-						const l = new Date(latest.date).getTime();
-						// R2-F5：手写/损坏日期解析为 NaN 时，NaN > x 恒 false → 静默视为
-						// 已审（缺口被吞）。保守方向：不可解析 → 报未审（宁多报不隐藏）。
-						if (!Number.isFinite(d) || !Number.isFinite(l)) return true;
-						return d > l;
-					},
-				)
+				.filter((e) => {
+					if (!e.date) return false;
+					// 时区混合比较（reviewer Medium-1）：chain.md 审计者手写为本地时区
+					// （`+08:00`），audit-log 为 toISOString UTC（`Z`）——字符串比较
+					// 把本地小时当 UTC 比，已审决策被误报未审。统一转 epoch ms。
+					const d = new Date(e.date).getTime();
+					const l = new Date(latest.date).getTime();
+					// R2-F5：手写/损坏日期解析为 NaN 时，NaN > x 恒 false → 静默视为
+					// 已审（缺口被吞）。保守方向：不可解析 → 报未审（宁多报不隐藏）。
+					if (!Number.isFinite(d) || !Number.isFinite(l)) return true;
+					return d > l;
+				})
 				.map((e) => ({ id: e.id, summary: e.summary, date: e.date }))
 		: chainEntries.map((e) => ({ id: e.id, summary: e.summary, date: e.date }));
 	const head = gitHead(cwd);
@@ -1001,9 +1006,9 @@ function parseAuditState(obj: Partial<AuditState>): AuditState {
 			// R3-F6：非法 status（LLM 写数字/拼写错误）→ 丢弃签名（fail-closed）——
 			// 旧代码只查 !== undefined，垃圾 status 通过消毒后 isAuditCompleted 视非
 			// failed 为完成 → 门禁误开且 blockers 静默丢失
-			(["passed", "blocked", "passed-with-warning", "failed"] as string[]).includes(
-				String((obj.signature as AuditSignature).status),
-			)
+			(
+				["passed", "blocked", "passed-with-warning", "failed"] as string[]
+			).includes(String((obj.signature as AuditSignature).status))
 				? {
 						status: (obj.signature as AuditSignature).status,
 						at:
@@ -1288,71 +1293,71 @@ export function writeAuditState(
 		} catch {
 			/* 备份失败不阻塞写 */
 		}
-			// LC-09：从备份恢复可解析字段（备份损坏/缺失时回退传入快照）。
-			// 注意 merge 顺序：传入 state 是「损坏时 readAuditState 返回的 DEFAULT +
-			// patch 字段」——直接 {...备份, ...state} 会让 DEFAULT 默认值覆盖备份的
-			// 真实进度（lastAuditedId/convExtractedLine/gatedHead/signature 归零）。
-			// 只让 state 中**非默认值**的字段（= 本次 patch 真正设置的）覆盖备份。
-			// 新备份 = 刚 rename 的损坏文件（半程写），大概率不可解析——按 mtime 新→旧
-			// 扫描目录内全部 .corrupt-*，取第一个可解析的（上次损坏/IO 错误场景备份的
-			// 完整旧版可恢复进度；sweepAtomicWrites 保留最新 2 份，旧备份写前未被清）。
+		// LC-09：从备份恢复可解析字段（备份损坏/缺失时回退传入快照）。
+		// 注意 merge 顺序：传入 state 是「损坏时 readAuditState 返回的 DEFAULT +
+		// patch 字段」——直接 {...备份, ...state} 会让 DEFAULT 默认值覆盖备份的
+		// 真实进度（lastAuditedId/convExtractedLine/gatedHead/signature 归零）。
+		// 只让 state 中**非默认值**的字段（= 本次 patch 真正设置的）覆盖备份。
+		// 新备份 = 刚 rename 的损坏文件（半程写），大概率不可解析——按 mtime 新→旧
+		// 扫描目录内全部 .corrupt-*，取第一个可解析的（上次损坏/IO 错误场景备份的
+		// 完整旧版可恢复进度；sweepAtomicWrites 保留最新 2 份，旧备份写前未被清）。
 		{
 			const candidates = backup ? [backup] : [];
-				try {
-					const dirEntries = fs
-						.readdirSync(path.dirname(file), { withFileTypes: true })
-						.filter(
-							(e) =>
-								e.isFile() &&
-								e.name.startsWith(`${path.basename(file)}.corrupt-`),
-						)
-						.map((e) => path.join(path.dirname(file), e.name))
-						.sort((a, b) => {
-							try {
-								return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
-							} catch {
-								return 0;
-							}
-						});
-					candidates.push(...dirEntries.filter((p) => p !== backup));
-				} catch {
-					/* 目录扫描失败：只试新备份 */
-				}
-				for (const b of candidates) {
-					try {
-						const raw = JSON.parse(fs.readFileSync(b, "utf-8")) as Record<
-							string,
-							unknown
-						>;
-						const nonDefault: Record<string, unknown> = {};
-						for (const k of Object.keys(state)) {
-							const key = k as keyof AuditState;
-							// 进度类字段：仅非默认值覆盖备份（防 DEFAULT 归零备份进度）；
-							// 锁/重置类字段（inFlight/auditFindings/lastError）：总是覆盖
-							// ——它们是操作语义不是进度（复审 Finding 2：failed 释放锁
-							// 补丁 inFlight:false、锁获取的 auditFindings:[] 清零若被过滤，
-							// 损坏重建后锁沿用备份 true → 有界停摆 / 陈旧 findings 被注入）
-							// R3-F3：blockedStreak 清零（passed 签名）同为重置语义——
-							// 0 === DEFAULT 被过滤会让备份的旧 streak 存活 → A2 门禁误触发
-							if (
-								key === "inFlight" ||
-								key === "auditFindings" ||
-								key === "lastError" ||
-								key === "blockedStreak" ||
-								state[key] !== DEFAULT_STATE[key]
-							) {
-								nonDefault[k] = state[key];
-							}
+			try {
+				const dirEntries = fs
+					.readdirSync(path.dirname(file), { withFileTypes: true })
+					.filter(
+						(e) =>
+							e.isFile() &&
+							e.name.startsWith(`${path.basename(file)}.corrupt-`),
+					)
+					.map((e) => path.join(path.dirname(file), e.name))
+					.sort((a, b) => {
+						try {
+							return fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs;
+						} catch {
+							return 0;
 						}
-						merged = { ...raw, ...nonDefault };
-						rebuiltFromCorrupt = true;
-						break;
-					} catch {
-						/* 该备份不可解析：试下一个 */
+					});
+				candidates.push(...dirEntries.filter((p) => p !== backup));
+			} catch {
+				/* 目录扫描失败：只试新备份 */
+			}
+			for (const b of candidates) {
+				try {
+					const raw = JSON.parse(fs.readFileSync(b, "utf-8")) as Record<
+						string,
+						unknown
+					>;
+					const nonDefault: Record<string, unknown> = {};
+					for (const k of Object.keys(state)) {
+						const key = k as keyof AuditState;
+						// 进度类字段：仅非默认值覆盖备份（防 DEFAULT 归零备份进度）；
+						// 锁/重置类字段（inFlight/auditFindings/lastError）：总是覆盖
+						// ——它们是操作语义不是进度（复审 Finding 2：failed 释放锁
+						// 补丁 inFlight:false、锁获取的 auditFindings:[] 清零若被过滤，
+						// 损坏重建后锁沿用备份 true → 有界停摆 / 陈旧 findings 被注入）
+						// R3-F3：blockedStreak 清零（passed 签名）同为重置语义——
+						// 0 === DEFAULT 被过滤会让备份的旧 streak 存活 → A2 门禁误触发
+						if (
+							key === "inFlight" ||
+							key === "auditFindings" ||
+							key === "lastError" ||
+							key === "blockedStreak" ||
+							state[key] !== DEFAULT_STATE[key]
+						) {
+							nonDefault[k] = state[key];
+						}
 					}
+					merged = { ...raw, ...nonDefault };
+					rebuiltFromCorrupt = true;
+					break;
+				} catch {
+					/* 该备份不可解析：试下一个 */
 				}
 			}
 		}
+	}
 	const payload = JSON.stringify(merged, null, 2);
 	fs.writeFileSync(tmp, payload, {
 		encoding: "utf-8",

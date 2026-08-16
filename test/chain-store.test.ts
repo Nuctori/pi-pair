@@ -2129,7 +2129,10 @@ test("shouldClearStaleLock：残留锁兜底判据（v1.0.21 行为级 + R5-F3 �
 	assert.equal(shouldClearStaleLock(base, false), true);
 	// R5-F3：auditStartedAt=0（年龄未知）→ 保守不清（真在跑的审计被清会并发双审计）
 	assert.equal(
-		shouldClearStaleLock({ ...readAuditState(tmpDir()), inFlight: true }, false),
+		shouldClearStaleLock(
+			{ ...readAuditState(tmpDir()), inFlight: true },
+			false,
+		),
 		false,
 	);
 });
@@ -2529,8 +2532,14 @@ test("T3：writeAuditState 清扫 .corrupt-*（R3-F1 起保留最新 2 份）与
 	fs.utimesSync(file + ".corrupt-old", old, old);
 	fs.utimesSync(file + ".tmp-stale", old, old);
 	writeAuditState(dir, { ...readAuditState(dir), inFlight: false });
-	assert.ok(!fs.existsSync(file + ".corrupt-old"), "最旧 corrupt 备份被删（只留最新 2 份）");
-	assert.ok(fs.existsSync(file + ".corrupt-mid"), "次新 corrupt 备份保留（R3-F1：最新一份按构造不可解析，需保留可解析旧备份）");
+	assert.ok(
+		!fs.existsSync(file + ".corrupt-old"),
+		"最旧 corrupt 备份被删（只留最新 2 份）",
+	);
+	assert.ok(
+		fs.existsSync(file + ".corrupt-mid"),
+		"次新 corrupt 备份保留（R3-F1：最新一份按构造不可解析，需保留可解析旧备份）",
+	);
 	assert.ok(fs.existsSync(file + ".corrupt-new"), "最新 corrupt 备份保留");
 	assert.ok(!fs.existsSync(file + ".tmp-stale"), "24h 前 tmp 残留被删");
 	assert.ok(fs.existsSync(file + ".tmp-fresh"), "新鲜 tmp 保留");
@@ -2826,7 +2835,10 @@ test("R1-F2: supersedes 元素消毒（防 \\n 注入伪条目）", () => {
 		"注入的伪条目不得被解析为决策",
 	);
 	assert.equal(parsed.length, 2, "只有两条真实决策");
-	assert.ok(e.supersedes?.every((s) => !s.includes("\n")), "supersedes 单行化");
+	assert.ok(
+		e.supersedes?.every((s) => !s.includes("\n")),
+		"supersedes 单行化",
+	);
 });
 
 test("R1-F3: 畸形条目存在时新 id 不与文本中已有 id 冲突", () => {
@@ -2854,7 +2866,11 @@ test("R1-F3: 畸形条目存在时新 id 不与文本中已有 id 冲突", () =>
 		decision: "d",
 		rationale: "r",
 	});
-	assert.notEqual(e.id, "D-004", "不得复用文本中已出现的 id（畸形条目不计入 parse）");
+	assert.notEqual(
+		e.id,
+		"D-004",
+		"不得复用文本中已出现的 id（畸形条目不计入 parse）",
+	);
 	const ids = parseChain(readRaw(dir)).map((x) => x.id);
 	assert.equal(new Set(ids).size, ids.length, "落盘后解析无重复 id");
 });
@@ -2878,7 +2894,11 @@ test("R1-F5: resolveProjectRoot 取最近带标记祖先（嵌套标记）", () 
 	const inner = path.join(root, "packages", "app");
 	fs.mkdirSync(inner, { recursive: true });
 	fs.writeFileSync(path.join(inner, "package.json"), "{}", "utf-8");
-	assert.equal(resolveProjectRoot(inner), inner, "最近带标记祖先（monorepo 子包）");
+	assert.equal(
+		resolveProjectRoot(inner),
+		inner,
+		"最近带标记祖先（monorepo 子包）",
+	);
 });
 
 test("R1-F6: cleanField 截断不切开 surrogate pair", () => {
@@ -2971,10 +2991,16 @@ test("R2-F3: 正文含 `## AUDIT-` 引用行不产生幻影条目、不导致写
 		runId: "r",
 		body: "正文开始\n## AUDIT-999: 引用旧条目\n正文结尾",
 	});
-	assert.ok(id.startsWith("AUDIT-"), "写成功（旧代码：幻影条目使末尾校验失败→3 次重试→抛冲突）");
+	assert.ok(
+		id.startsWith("AUDIT-"),
+		"写成功（旧代码：幻影条目使末尾校验失败→3 次重试→抛冲突）",
+	);
 	const entries = readAuditLog(dir);
 	assert.equal(entries.length, 1, "正文中的 ## AUDIT- 行不得被解析为幻影条目");
-	assert.ok(entries[0].body.includes("AUDIT-999"), "引用内容保留（转义而非删除）");
+	assert.ok(
+		entries[0].body.includes("AUDIT-999"),
+		"引用内容保留（转义而非删除）",
+	);
 	assert.ok(
 		entries[0].body.includes("<!-- ## AUDIT-999"),
 		"引用行已转义为 HTML 注释（行首不再匹配条目头）",
@@ -3034,7 +3060,10 @@ test("R2-F5: 不可解析日期不静默视为已审（NaN 比较保守方向）
 	// 最新审计 Date 是现在（2026）→ D-001 已审；D-002 日期不可解析：
 	// NaN > x 恒 false → 旧代码静默视为已审（缺口被吞）；必须保守报未审
 	const ids = queryGaps(dir).proofGaps.unreviewedDecisions.map((d) => d.id);
-	assert.ok(ids.includes("D-002"), "不可解析日期必须保守报未审（不得静默隐藏缺口）");
+	assert.ok(
+		ids.includes("D-002"),
+		"不可解析日期必须保守报未审（不得静默隐藏缺口）",
+	);
 	assert.ok(!ids.includes("D-001"), "合法旧日期仍为已审");
 });
 
@@ -3127,7 +3156,11 @@ test("R3-F3: 损坏重建保留 blockedStreak 清零补丁（非默认值过滤�
 		0,
 		"清零补丁必须生效（旧代码：0 === DEFAULT 被过滤 → 备份的 3 存活 → A2 门禁误触发）",
 	);
-	assert.equal(after.lastAuditedId, "D-010", "备份真实进度仍恢复（非默认值字段不受影响）");
+	assert.equal(
+		after.lastAuditedId,
+		"D-010",
+		"备份真实进度仍恢复（非默认值字段不受影响）",
+	);
 });
 
 test("R3-F5: state.json 缺失但 .corrupt-* 备份存在时仍恢复进度", () => {
@@ -3137,7 +3170,11 @@ test("R3-F5: state.json 缺失但 .corrupt-* 备份存在时仍恢复进度", ()
 	// SIGKILL 落在 rename 窗口：损坏文件已被移走、新文件未落盘 → state.json 缺失
 	fs.writeFileSync(
 		file + ".corrupt-1",
-		JSON.stringify({ lastAuditedId: "D-010", gatedHead: "abc123", blockedStreak: 2 }),
+		JSON.stringify({
+			lastAuditedId: "D-010",
+			gatedHead: "abc123",
+			blockedStreak: 2,
+		}),
 		"utf-8",
 	);
 	const st = { ...readAuditState(tmpDir()), lastAuditedId: "D-011" };
@@ -3160,7 +3197,12 @@ test("R3-F6: 非法 signature.status 丢弃签名（fail-closed，防门禁误�
 	fs.writeFileSync(
 		file,
 		JSON.stringify({
-			signature: { status: 42, at: Date.now() + 1000, runId: "r1", blockers: ["x"] },
+			signature: {
+				status: 42,
+				at: Date.now() + 1000,
+				runId: "r1",
+				blockers: ["x"],
+			},
 		}),
 		"utf-8",
 	);
@@ -3269,7 +3311,9 @@ test("R4-F5: appendConv 单行化处理裸 \\r 与 U+2028/U+2029（防视觉注�
 	const line = raw.split(/\r?\n/).find((l) => l.includes("正常行"));
 	assert.ok(line, "消息行存在");
 	assert.ok(
-		!line.includes("\r") && !line.includes("\u2028") && !line.includes("\u2029"),
+		!line.includes("\r") &&
+			!line.includes("\u2028") &&
+			!line.includes("\u2029"),
 		"裸 \\r / U+2028 / U+2029 必须单行化（旧代码：仅 \\r?\\n → 审计者 read 工具按通用换行渲染为两行，伪造用户行视觉注入）",
 	);
 });
@@ -3291,7 +3335,12 @@ test("R4-F6: convlogForeignRuns 的 Task: 排除按内容前缀（子串匹配�
 test("R5-F1: at=0 签名不得作为注入去重键（0 = 缺失，跨 run 撞键）", () => {
 	const base = { ...readAuditState(tmpDir()), auditRunId: "run-A" };
 	// B5 兜底路径：审计者手写签名漏 at → 消毒为 0
-	const sig = { status: "blocked" as const, at: 0, blockers: ["X"], head: "h1" };
+	const sig = {
+		status: "blocked" as const,
+		at: 0,
+		blockers: ["X"],
+		head: "h1",
+	};
 	// 首条 at=0：注入
 	assert.equal(
 		shouldInjectSignatureFindings({ ...base, signature: sig }, undefined, "h1"),
@@ -3314,7 +3363,11 @@ test("R5-F1: at=0 签名不得作为注入去重键（0 = 缺失，跨 run 撞�
 });
 
 test("R5-F2: 缺 runId 签名不得靠时钟容差满足本轮门禁", () => {
-	const base = { ...readAuditState(tmpDir()), auditRunId: "run-B", inFlight: false };
+	const base = {
+		...readAuditState(tmpDir()),
+		auditRunId: "run-B",
+		inFlight: false,
+	};
 	// 前轮签名（60s 前完成，在 5min 容差内，漏写 runId）——兼容路径无身份可校验
 	const stale = {
 		...base,
@@ -3376,7 +3429,11 @@ test("R5-F5: appendGeneralization 字段含 | 分隔符词组不错位", () => {
 });
 
 test("R5-F6: B5 兜底分支（at=0 + lastAuditAt）同享时钟容差", () => {
-	const base = { ...readAuditState(tmpDir()), auditRunId: "run-B", inFlight: false };
+	const base = {
+		...readAuditState(tmpDir()),
+		auditRunId: "run-B",
+		inFlight: false,
+	};
 	// runId 匹配（身份可校验）→ at=0 走 B5：lastAuditAt 在容差内（慢钟主机 3min）
 	const st = {
 		...base,
