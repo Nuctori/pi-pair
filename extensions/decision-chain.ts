@@ -599,13 +599,13 @@ function findingsObserverTick(ui: ExtensionUIContext, root: string): void {
 			const n = (idleTicks.get(root) ?? 0) + 1;
 			if (n >= 3) {
 				stopFindingsObserver(root); // 审计完成：观察器自停
-				stopAuditBreath(root); // F-13：观察器是纯 state 轮询——事件通道
+				stopAuditBreath(root); // F-14：观察器是纯 state 轮询——事件通道
 				// （async-complete）丢失时唯一可靠的灭灯兜底。F-11 修过多实例短路
 				// 场景的常亮（实证 17006s），但 event 未达 + 无并发实例时 agent_end
 				// 三条通道全部空转（state 已干净 → stale 清理/短路判据不成立）→
 				// 灯常亮数小时（实证 12085s）。观察器每 20s 读 state，inFlight=false
 				// 即审计完成——与 stopFindingsObserver 同点灭灯，事件无关。
-				// （编号 F-13：F-12 已为 v1.0.39 门禁等待超时上限占用——审计者观察）
+				// （编号 F-14：F-12/F-13 已为 v1.0.39/1.0.40 门禁等待超时上限与轮询 timer 占用——审计者二次观察）
 				return;
 			}
 			idleTicks.set(root, n);

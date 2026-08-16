@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.0.83] - 2026-08-16
+
+用户报障「结对审计进行中（10843s/12085s）」呼吸灯常亮——审计已完成（state passed）但灯不灭（F-12→F-14）：
+
+- **审计完成但呼吸灯常亮（medium，F-14）**：灭灯三通道（async-complete 事件 / agent_end stale 清理 / 多实例短路 F-11）在「事件丢失 + state 已干净」场景全部空转（实证 12085s ≈ 3.4h 常亮）。findingsObserver 每 20s 轮询 state.json 检测到 `inFlight=false`×3 却只自停观察器不灭灯。修复：findingsObserverTick 完成检测同点调用 `stopAuditBreath(root)`——纯 state 轮询灭灯兜底，事件无关；多实例 cwd 校验保留。测试：接线守卫断言（F-14 回归锁）。编号说明：F-12/F-13 已被 v1.0.39/1.0.40 占用，本修复取 F-14。
+- 验证：95/95 通过，tsc 0。
+
 ## [1.0.82] - 2026-08-15
 
 5 轮独立 subagent 对抗性审计第 5 轮（注入/签名/杂项，reviewer fresh 只读）——5 轮审计全部完成：
