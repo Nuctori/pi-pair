@@ -842,9 +842,7 @@ test("接线守卫：目标架构（单层审计 + fresh spawn + L2 门禁 + 价
 			if (!registered.has(f)) registered.set(f, new Set());
 			registered.get(f)!.add(v);
 		}
-		const mentioned = new Set(
-			[...src.matchAll(/F-(\d+)/g)].map((m) => m[1]),
-		);
+		const mentioned = new Set([...src.matchAll(/F-(\d+)/g)].map((m) => m[1]));
 		const unregistered = [...mentioned].filter(
 			(f) => !FNUM_HISTORY_EXEMPT.has(f) && !registered.has(f),
 		);
