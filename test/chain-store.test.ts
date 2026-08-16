@@ -825,17 +825,37 @@ test("接线守卫：目标架构（单层审计 + fresh spawn + L2 门禁 + 价
 		"findingsObserverTick 检测到审计完成（inFlight=false×3）必须同步灭灯（F-14 回归锁）",
 	);
 	// F-number 唯一性（v1.0.83 泛化发现闭环）：连续两次撞号实证（F-12 被 v1.0.39
-	// 占用、F-13 被 v1.0.40 占用——人工 grep 排重不可靠）。断言：每个 F-NN 编号
-	// 只能对应一个 v1.0.XX 版本标记（`F-NN（v1.0.XX）` 或 `F-NN，v1.0.XX` 形态），
-	// 同编号多版本 = 撞号。新编号必须在此约束下分配。
+	// 占用、F-13 被 v1.0.40 占用——人工 grep 排重不可靠）。两级断言：
+	// ① 登记完备性——每个 F-NN 编号必须在源码中至少出现一次「编号+版本」邻接
+	//    登记形态（`F-NN（v1.0.XX）` / `F-NN，v1.0.XX`），纯叙述引用（`F-NN：`）
+	//    不构成登记。这堵住「叙述形态撞号」：新修复只写 `F-14：` 而无登记 → 断言
+	//    失败，强制补 `F-14（v1.0.83）` → 与既有登记撞号时被 ② 拦截（reviewer
+	//    Medium：旧断言只扫邻接形态，对真实两次撞号的叙述形态完全失明——回溯
+	//    1ab8511/79d3058 均 PASS，当前 F-14 自身也未登记）。
+	//    历史豁免：F-01..F-08 引入于登记惯例（v1.0.28）之前，无版本标记，豁免。
+	// ② 登记唯一性——同编号多版本 = 撞号。新编号必须在此约束下分配。
 	{
-		const fnums = new Map<string, Set<string>>();
-		for (const m of src.matchAll(/F-(\d+)[（(，,]?\s*v?1\.0\.(\d+)/g)) {
+		const FNUM_HISTORY_EXEMPT = new Set(["01", "02", "03", "06", "08"]);
+		const registered = new Map<string, Set<string>>();
+		for (const m of src.matchAll(/F-(\d+)[（(，,]\s*v?1\.0\.(\d+)/g)) {
 			const [f, v] = [m[1], m[2]];
-			if (!fnums.has(f)) fnums.set(f, new Set());
-			fnums.get(f)!.add(v);
+			if (!registered.has(f)) registered.set(f, new Set());
+			registered.get(f)!.add(v);
 		}
-		const dup = [...fnums.entries()].filter(([, vs]) => vs.size > 1);
+		const mentioned = new Set(
+			[...src.matchAll(/F-(\d+)/g)].map((m) => m[1]),
+		);
+		const unregistered = [...mentioned].filter(
+			(f) => !FNUM_HISTORY_EXEMPT.has(f) && !registered.has(f),
+		);
+		assert.deepEqual(
+			unregistered,
+			[],
+			`F-number 无版本登记（纯叙述引用，须补 F-NN（v1.0.XX））：${unregistered
+				.map((f) => `F-${f}`)
+				.join(", ")}`,
+		);
+		const dup = [...registered.entries()].filter(([, vs]) => vs.size > 1);
 		assert.deepEqual(
 			dup,
 			[],

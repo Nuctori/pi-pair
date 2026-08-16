@@ -605,7 +605,7 @@ function findingsObserverTick(ui: ExtensionUIContext, root: string): void {
 				// 三条通道全部空转（state 已干净 → stale 清理/短路判据不成立）→
 				// 灯常亮数小时（实证 12085s）。观察器每 20s 读 state，inFlight=false
 				// 即审计完成——与 stopFindingsObserver 同点灭灯，事件无关。
-				// （编号 F-14：F-12/F-13 已为 v1.0.39/1.0.40 门禁等待超时上限与轮询 timer 占用——审计者二次观察）
+				// （编号 F-14（v1.0.83）：F-12/F-13 已为 v1.0.39/1.0.40 门禁等待超时上限与轮询 timer 占用——审计者二次观察）
 				return;
 			}
 			idleTicks.set(root, n);
