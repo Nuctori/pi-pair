@@ -817,6 +817,13 @@ test("接线守卫：目标架构（单层审计 + fresh spawn + L2 门禁 + 价
 			src.includes("stopFindingsObserver(auditBreathCwd"),
 		"观察器必须随呼吸灯生命周期启停（start 接线 + stop 汇聚）",
 	);
+	// F-12（v1.0.83）：观察器自停必须同步灭灯——事件通道（async-complete）丢失时
+	// 观察器是唯一纯 state 轮询兜底（实证 12085s 常亮；F-11 只覆盖多实例短路场景）
+	assert.ok(
+		src.includes("stopFindingsObserver(root); // 审计完成：观察器自停") &&
+			src.includes("stopAuditBreath(root); // F-12"),
+		"findingsObserverTick 检测到审计完成（inFlight=false×3）必须同步灭灯（F-12 回归锁）",
+	);
 	// v1.0.55b：pair_gaps 回抄禁令双点同步（reviewer Low——任务文本 + agent 协议）
 	assert.ok(
 		agentSrc.includes("不要直接回抄 pair_gaps"),
