@@ -824,6 +824,26 @@ test("接线守卫：目标架构（单层审计 + fresh spawn + L2 门禁 + 价
 			src.includes("stopAuditBreath(root); // F-14"),
 		"findingsObserverTick 检测到审计完成（inFlight=false×3）必须同步灭灯（F-14 回归锁）",
 	);
+	// F-number 唯一性（v1.0.83 泛化发现闭环）：连续两次撞号实证（F-12 被 v1.0.39
+	// 占用、F-13 被 v1.0.40 占用——人工 grep 排重不可靠）。断言：每个 F-NN 编号
+	// 只能对应一个 v1.0.XX 版本标记（`F-NN（v1.0.XX）` 或 `F-NN，v1.0.XX` 形态），
+	// 同编号多版本 = 撞号。新编号必须在此约束下分配。
+	{
+		const fnums = new Map<string, Set<string>>();
+		for (const m of src.matchAll(/F-(\d+)[（(，,]?\s*v?1\.0\.(\d+)/g)) {
+			const [f, v] = [m[1], m[2]];
+			if (!fnums.has(f)) fnums.set(f, new Set());
+			fnums.get(f)!.add(v);
+		}
+		const dup = [...fnums.entries()].filter(([, vs]) => vs.size > 1);
+		assert.deepEqual(
+			dup,
+			[],
+			`F-number 撞号（同编号多版本）：${dup
+				.map(([f, vs]) => `F-${f}→${[...vs].join("/")}`)
+				.join(", ")}`,
+		);
+	}
 	// v1.0.55b：pair_gaps 回抄禁令双点同步（reviewer Low——任务文本 + agent 协议）
 	assert.ok(
 		agentSrc.includes("不要直接回抄 pair_gaps"),
