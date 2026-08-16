@@ -832,17 +832,31 @@ test("接线守卫：目标架构（单层审计 + fresh spawn + L2 门禁 + 价
 	//    失败，强制补 `F-14（v1.0.83）` → 与既有登记撞号时被 ② 拦截（reviewer
 	//    Medium：旧断言只扫邻接形态，对真实两次撞号的叙述形态完全失明——回溯
 	//    1ab8511/79d3058 均 PASS，当前 F-14 自身也未登记）。
-	//    历史豁免：F-01..F-08 引入于登记惯例（v1.0.28）之前，无版本标记，豁免。
-	// ② 登记唯一性——同编号多版本 = 撞号。新编号必须在此约束下分配。
+	//    历史豁免：F-01/02/03/06/08 引入于登记惯例（v1.0.28）之前且无版本登记；
+	//    F-04/05 未出现于源码；F-07 以无连字符形态 "F7（v1.0.29" 出现（reviewer
+	//    Low-3：正则 `F-?` 容忍该形态，其有登记故不需豁免）。负向后行断言
+	//    `(?<![A-Za-z0-9-])` 排除 R5-F1 等前缀编号误匹配（"UTF-16" 的 F-16 同理，
+	//    前邻字母/数字/连字符均排除——实证 "F1" 误报）；可选子编号组兼容
+	//    "F4/B-2（v1.0.29" 登记形态。
+	//    历史撞号豁免（reviewer Low-3 延伸，CHANGELOG 实证）：F10/F12 在 v1.0.29
+	//    无连字符时代被不同机制复用——F10（v1.0.29 session_shutdown 隔离）vs
+	//    F-10（v1.0.28 呼吸灯自愈）；F12（v1.0.29 /pair-audit 锁重置）vs
+	//    F-12（v1.0.39 门禁超时上限）。已知遗留豁免；**新编号不受豁免**。
+	// ② 登记唯一性——同编号多版本 = 撞号（历史撞号豁免除外）。新编号必须在此约束下分配。
 	{
 		const FNUM_HISTORY_EXEMPT = new Set(["01", "02", "03", "06", "08"]);
+		const FNUM_LEGACY_DUP = new Set(["10", "12"]); // 历史撞号，豁免
 		const registered = new Map<string, Set<string>>();
-		for (const m of src.matchAll(/F-(\d+)[（(，,]\s*v?1\.0\.(\d+)/g)) {
+		for (const m of src.matchAll(
+			/(?<![A-Za-z0-9-])F-?(\d+)(?:\/[A-Za-z0-9-]+)?[（(，,]\s*v?1\.0\.(\d+)/g,
+		)) {
 			const [f, v] = [m[1], m[2]];
 			if (!registered.has(f)) registered.set(f, new Set());
 			registered.get(f)!.add(v);
 		}
-		const mentioned = new Set([...src.matchAll(/F-(\d+)/g)].map((m) => m[1]));
+		const mentioned = new Set(
+			[...src.matchAll(/(?<![A-Za-z0-9-])F-?(\d+)/g)].map((m) => m[1]),
+		);
 		const unregistered = [...mentioned].filter(
 			(f) => !FNUM_HISTORY_EXEMPT.has(f) && !registered.has(f),
 		);
@@ -853,7 +867,9 @@ test("接线守卫：目标架构（单层审计 + fresh spawn + L2 门禁 + 价
 				.map((f) => `F-${f}`)
 				.join(", ")}`,
 		);
-		const dup = [...registered.entries()].filter(([, vs]) => vs.size > 1);
+		const dup = [...registered.entries()].filter(
+			([f, vs]) => vs.size > 1 && !FNUM_LEGACY_DUP.has(f),
+		);
 		assert.deepEqual(
 			dup,
 			[],
