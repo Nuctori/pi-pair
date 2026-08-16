@@ -1366,11 +1366,11 @@ export default function (pi: ExtensionAPI): void {
 						if (
 							!patchAuditState(root, {
 								injectedSignatureAt: sigTriggered
-									? (state.signature!.at || Date.now()) // R5-F1：at=0（审计者漏写）用当前时间持久化，防 0 撞键
+									? state.signature!.at || Date.now() // R5-F1：at=0（审计者漏写）用当前时间持久化，防 0 撞键
 									: (injectedSignatureAt.get(root) ??
 										state.injectedSignatureAt),
 								injectedInterimAt: interimTriggered
-									? (state.auditStartedAt || Date.now()) // R5-F1（中间态孪生）：auditStartedAt=0 防 0 撞键
+									? state.auditStartedAt || Date.now() // R5-F1（中间态孪生）：auditStartedAt=0 防 0 撞键
 									: (injectedInterimAt.get(root) ?? state.injectedInterimAt),
 							})
 						) {
@@ -1395,10 +1395,10 @@ export default function (pi: ExtensionAPI): void {
 							// `?? null` 会把已持久化的 injectedSignatureAt 覆写为 null →
 							// 跨会话去重失效重注入。回退到 state 持久化值（非 null 清空）
 							injectedSignatureAt: sigTriggered
-								? (state.signature!.at || Date.now()) // R5-F1：at=0（审计者漏写）用当前时间持久化，防 0 撞键
+								? state.signature!.at || Date.now() // R5-F1：at=0（审计者漏写）用当前时间持久化，防 0 撞键
 								: (injectedSignatureAt.get(root) ?? state.injectedSignatureAt),
 							injectedInterimAt: interimTriggered
-								? (state.auditStartedAt || Date.now()) // R5-F1（中间态孪生）：auditStartedAt=0 防 0 撞键
+								? state.auditStartedAt || Date.now() // R5-F1（中间态孪生）：auditStartedAt=0 防 0 撞键
 								: (injectedInterimAt.get(root) ?? state.injectedInterimAt),
 						})
 					) {
