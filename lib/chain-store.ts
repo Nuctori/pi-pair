@@ -370,7 +370,7 @@ export function appendAuditReport(
 	for (let attempt = 0; attempt < 3; attempt++) {
 		const expectedMtime = auditLogMtime(file);
 		const raw = readRawAuditLog(file);
-		const id = `AUDIT-${Date.now()}`;
+		const id = `AUDIT-${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 		const lines = [
 			`## ${id}: ${fields.verdict}`,
 			`- Verdict: ${fields.verdict}`,
@@ -387,7 +387,7 @@ export function appendAuditReport(
 		// （证明链空洞）。转义为 HTML 注释行，内容保留但不再匹配条目头。
 		const escapedBody = fields.body
 			.split("\n")
-			.map((l) => (/^## AUDIT-\d+: /.test(l) ? `<!-- ${l} -->` : l))
+			.map((l) => (/^## AUDIT-[\w-]+: /.test(l) ? `<!-- ${l} -->` : l))
 			.join("\n");
 		const payload = `${raw.replace(/\r?\n$/, "")}\n\n${lines.join("\n")}${escapedBody}\n`;
 		const tmp = `${file}.tmp-${process.pid}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
@@ -414,7 +414,7 @@ export function appendAuditReport(
 		let verified = false;
 		try {
 			const onDisk = fs.readFileSync(file, "utf-8");
-			const entries = [...onDisk.matchAll(/^## AUDIT-\d+: .+$/gm)];
+			const entries = [...onDisk.matchAll(/^## AUDIT-[\w-]+: .+$/gm)];
 			verified =
 				onDisk === payload &&
 				entries.length > 0 &&
@@ -449,7 +449,7 @@ export interface AuditLogEntry {
 /** 解析 audit-log.md 全部条目（含每个条目正文里的泛化发现 section）。 */
 export function parseAuditLog(raw: string): AuditLogEntry[] {
 	const out: AuditLogEntry[] = [];
-	const headRe = /^## (AUDIT-\d+): (.+)$/gm;
+	const headRe = /^## (AUDIT-[\w-]+): (.+)$/gm;
 	let m: RegExpExecArray | null;
 	while ((m = headRe.exec(raw)) !== null) {
 		const start = m.index + m[0].length;
@@ -609,11 +609,14 @@ export function backfillAuditLogIfNeeded(
 		{
 			verdict: sig.status === "blocked" ? "blocked" : "passed",
 			head: sig.head ?? "",
-			window: "（豁免补写：audit-log ≥30KB 审计者未落盘，扩展原子补写元数据）",
+			window:
+				"（扩展补写：审计者未落盘完整报告，正文由 state 派生，证明链无空洞）",
 			blockers,
 			// v1.0.64：runId 与判定同源（sig.runId ?? auditRunId）——幂等匹配的基础
 			runId: sigRunId,
-			body: "扩展补写元数据条目（审计结论见 state.json signature/blockers，泛化发现在 gaps.md）。",
+			// v1.0.86（#1 修复）：≥30KB 豁免路径不再写空壳正文——审计者未落盘完整报告时，
+			// 用 state 里已存在的审计者中间态 auditFindings + 真实 blockers 重建正文（buildAuditBackfillBody）。
+			body: buildAuditBackfillBody(state, sig.blockers ?? []),
 		},
 		// R2-F6：补写日期 = 签名 at（实际审计完成时刻）——用补写时刻 now 会
 		// 掩盖 at 与补写之间的新决策（被误判已审）
@@ -2160,3 +2163,78 @@ export function convlogForeignRuns(cwd: string, ownRunId: string): number {
 // ---- 待审增量记账（增量累积唤起）----
 // 已删除：L0 独立层（accumulateRound/checkAuditDue/AuditConfig）——单层审计在 agent_end
 // 直接按两个便宜信号判定（hasUncommittedChanges or hasNewConversation）触发，无需累积记账。
+
+// v1.0.86（#1 修复）：≥30KB 豁免路径补写正文——审计者未落盘完整报告时，
+// 用 state 里已存在的审计者中间态 auditFindings + 真实 blockers 重建正文，证明链无空洞且推理不丢。
+export function buildAuditBackfillBody(
+	state: AuditState,
+	sigBlockers: string[],
+): string {
+	const realFindings = state.auditFindings.filter(
+		(f) => !isPlaceholderFinding(f),
+	);
+	const bodyParts: string[] = [];
+	if (sigBlockers.length > 0) {
+		bodyParts.push(
+			"## Blockers\n" + sigBlockers.map((b) => `- ${b}`).join("\n"),
+		);
+	}
+	const extraFindings = realFindings.filter((f) => !sigBlockers.includes(f));
+	if (extraFindings.length > 0) {
+		bodyParts.push(
+			"## Audit Findings (interim)\n" +
+				extraFindings.map((f) => `- ${f}`).join("\n"),
+		);
+	}
+	return bodyParts.length > 0
+		? bodyParts.join("\n\n")
+		: "扩展补写元数据条目（审计者未落盘完整报告；结论见 state.json signature，泛化发现在 gaps.md）。";
+}
+
+// ---- 用户输入触发词分类（v1.0.84，扩展层机械判定）----
+export type AuditTrigger = "request" | "skip" | "cancel" | null;
+const CANCEL_WORDS = [
+	"取消审计",
+	"停掉审计",
+	"停止审计",
+	"终止审计",
+	"别审了",
+	"cancel audit",
+	"stop audit",
+] as const;
+const SKIP_WORDS = [
+	"不用审",
+	"别审",
+	"跳过审计",
+	"不审计",
+	"先不审",
+	"不用审计",
+	"免审",
+	"无需审计",
+	"不用再审",
+	"skip audit",
+	"no audit",
+] as const;
+const REQUEST_WORDS = [
+	"帮我审",
+	"帮我审计",
+	"审一下",
+	"审一审",
+	"审计一下",
+	"审计这个",
+	"审计我的",
+	"审计本轮",
+	"审计本次",
+	"pair audit",
+	"audit my",
+	"audit the",
+	"audit this",
+] as const;
+export function classifyAuditTrigger(prompt: string): AuditTrigger {
+	const text = prompt.trim();
+	if (!text) return null;
+	if (CANCEL_WORDS.some((w) => text.includes(w))) return "cancel";
+	if (SKIP_WORDS.some((w) => text.includes(w))) return "skip";
+	if (REQUEST_WORDS.some((w) => text.includes(w))) return "request";
+	return null;
+}

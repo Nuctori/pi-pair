@@ -1,11 +1,35 @@
 # Changelog
 
+## [1.0.86] - 2026-08-24
+
+两处审计可靠性修复（行为级测试锁定）：
+
+- **过程结对审计完全不触发（回归，high）**：v1.0.85 #3 给「未提交改动」触发分支加了 `toolsThisRound > 0` 门槛（本轮有代码工具调用才 spawn），但扩展在 `pi.on("tool_call")` 上计数 `roundToolCalls`——宿主 `_emitExtensionEvent` 从不向扩展转发 `tool_call` 事件，监听器永不触发 → `roundToolCalls` 恒 0 → 未提交改动轮的过程审计永不满足门槛，只有 commit 轮（hasNewCommit）照常触发。修复：监听改 `tool_execution_start`（宿主实际转发、同样带 `toolName`）。机制完整性盲区⑥通过。
+- **≥30KB 审计日志正文静默丢失（#1，high）**：审计者未落盘完整报告时，扩展 `backfillAuditLogIfNeeded` 原只写「扩展补写元数据条目」空壳（≥30KB 豁免路径），推理正文永久丢失。修复分层：① 新增确定性 `audit_report_append` 工具（扩展原子写 + mtime 乐观锁，正文绝不丢失），审计者报告经该工具落盘，删除「≥30KB 豁免、用 write 全量重建 audit-log」指令（agent SKILL 同步）；② `backfillAuditLogIfNeeded` 兜底不再写空壳——用 state.auditFindings + 真实 blockers 重建正文（auditFindings 占位过滤 + blockers 去重），审计者被强杀时仍能补回正文。历史空壳条目不回溯改写（幂等早返回，不破坏既有证明链）。
+- 验证：102/102 通过（+1 #1 body 重建断言 + #3 守卫事件名同步），tsc 0。
+
+## [1.0.85] - 2026-08-16
+
+用户视角审查（7 条不友好行为全修，测试驱动闭环——接线守卫断言期望行为后实现）：
+
+- **审计结论不再伪装用户消息（#1，high）**：blocked 交付从 `sendUserMessage(deliverAs:"followUp")`（user 形态 → agent 误以为用户指令、回复「按你的要求修复了」）改为 `pi.sendMessage({ customType: "pi-pair-audit-findings" }, { triggerTurn: true, deliverAs: "followUp" })`——系统消息形态唤醒 agent **立即处理**（审计缺口 = 交付缺陷，细化精度闭环），但 agent 知道这是审计报告非用户话语（SKILL 声明处理规则）。
+- **闲聊轮不烧审计（#3，medium）**：`hasUncommittedChanges` 单独不再触发 spawn（历史脏工作区 ≠ 本轮有工作）——加 `tool_call` 事件计数（edit/write/bash 等代码类工具），本轮没动手不 spawn。D-006 零 spawn 语义从「纯咨询」扩展到「没动手」。
+- **findings 弹窗节流（#4，low）**：观察器同轮审计只 notify 首条真实 findings，后续由呼吸灯「已发现 N 项」计数承接（此前审计者快速产出时逐条弹窗刷屏）。
+- **失败必通知（#5，medium）**：三条失败路径统一 notify「审计未完成（原因）——下轮补审或 /pair-audit」：① spawn 失败无提交轮（此前静默）② run 异常终止无签名（此前静默，只留下轮惊悚注入）③ 门禁超时降级（此前完全静默）。
+- **触发词写死词表（#6）**：宽松正则全部干掉，改固定数组（REQUEST_WORDS/SKIP_WORDS/CANCEL_WORDS，子串匹配）——裸「审计」/裸 "audit" 不再触发（名词语境误触发面），只认明确请求组合（帮我审/审一下/审计一下/审计这个/审计我的/pair audit/audit my|the|this）。
+- **对话落盘知情 + 控制（#7）**：convlog 持久化默认保留（审计者证据源），加 `PI_PAIR_CONVLOG=0` 关闭开关；SKILL 声明。
+- **多实例 warning 去重（#8）**：每 root 每会话只弹一次（nonGitRootWarned 模式），纯聊天轮不再每轮弹技术性警告。
+- 验证：101/101 通过（+1 接线守卫 + 触发词测试收紧），tsc 0。
+
+## [1.0.84] - 2026-08-16
+
+用户报障「审计者明显 subagent 错误后呼吸灯依旧常亮（4387s ≈ 73min）」——run 失败但灯不灭（F-15）：
+
+- **审计者 run 异常终止后呼吸灯常亮（medium，F-15）**：run 失败（崩溃/provider 报错）时 `state.inFlight` 残留 true，三条灭灯通道全失效：① async-complete 事件丢失或 runId 匹配失败（spawn 存的是 `runId ?? asyncId` 单值，事件 payload 字段互缺 → `completedCwd=null`）；② 事件内 TTL 兜底只在事件到达那一刻执行一次（事件早到、TTL 未过期 → 之后无触发源）；③ agent_end deadAuditor 需 stopRun 成功才灭灯。修复：findingsObserverTick（唯一与灯同生命周期、事件无关的 20s 常驻轮询）增加 TTL 超龄灭灯兜底（16min 判定 run 已死，与既有 TTL 语义一致）→ 删内存条目 + 停观察 + 灭灯，run 回收留给 agent_end/session_shutdown 既有通道；async-complete 匹配加固双 id（runId/asyncId 任一命中）。测试：接线守卫新增断言。
+- **用户输入触发词（新功能）**：`before_agent_start` 读 `event.prompt` 机械分类（lib 纯函数 `classifyAuditTrigger`，行为级测试锁定）：**请求**（审一下/帮我审/审计/pair audit 等）→ 本轮 agent_end 强制 spawn（等价 /pair-audit 无参数）；**豁免**（不用审/别审/跳过审计/skip audit 等）→ 本轮 agent_end 跳过自动审计（单轮语义，未覆盖提交下轮自然补审）；**取消**（取消审计/停掉审计/别审了/cancel audit 等）→ 异步 stop 在跑审计 + 本轮豁免。优先级 cancel > skip > request（同轮多条命中取最高，保守不触发）。信号会话级置位/消费/清零（FP #3 模式）。测试：+5 触发词行为测试。
+- 验证：100/100 通过（+5 触发词测试 + 接线守卫），tsc 0。
+
 ## [1.0.83] - 2026-08-16
-
-用户报障「结对审计进行中（10843s/12085s）」呼吸灯常亮——审计已完成（state passed）但灯不灭（F-12→F-14）：
-
-- **审计完成但呼吸灯常亮（medium，F-14）**：灭灯三通道（async-complete 事件 / agent_end stale 清理 / 多实例短路 F-11）在「事件丢失 + state 已干净」场景全部空转（实证 12085s ≈ 3.4h 常亮）。findingsObserver 每 20s 轮询 state.json 检测到 `inFlight=false`×3 却只自停观察器不灭灯。修复：findingsObserverTick 完成检测同点调用 `stopAuditBreath(root)`——纯 state 轮询灭灯兜底，事件无关；多实例 cwd 校验保留。测试：接线守卫断言（F-14 回归锁）。编号说明：F-12/F-13 已被 v1.0.39/1.0.40 占用，本修复取 F-14。
-- 验证：95/95 通过，tsc 0。
 
 ## [1.0.82] - 2026-08-15
 

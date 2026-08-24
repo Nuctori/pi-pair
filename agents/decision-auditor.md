@@ -131,7 +131,7 @@ acceptanceRole: writer
 
 ## 收尾（每次审计必做）
 
-**报告落盘（证明链，先报告后签名，v1.0.48）**：写 signature **之前**，先把本轮审计报告 append 到审计报告日志（与 chain.md 同目录策略：默认 `.pi/decision-auditor/audit-log.md`，`PI_PAIR_CHAIN_PUBLIC=1` 时 `docs/decisions/audit-log.md`）。write 纪律同 chain.md：read 全文 → content = 原文 + 新条目（一个字符不少）。条目格式：
+**报告落盘（证明链，先报告后签名，v1.0.48/v1.0.86 源头版）**：写 signature **之前**，用 `audit_report_append` 工具把本轮审计报告确定性追加到审计日志（扩展原子写，不读不写整个文件）。**禁止用 write 全量重建 audit-log**（30KB+ 文件全量重建有压缩/出错风险，v1.0.60 的痛点）。verdict 取 passed/blocked/low-value；head = `git rev-parse HEAD` 全哈希；window = 审计窗口概述（决策范围+提交+未提交文件）；blockers = 具体可操作缺口（blocked 时）；body = 你的审计输出（目标推导+独立核实+逐条判定+总评，多行原样）。条目格式由工具处理，无需手写 `## AUDIT-` 头。
 
 ```markdown
 ## AUDIT-<epoch ms>: <passed|blocked|low-value>
@@ -145,7 +145,7 @@ acceptanceRole: writer
 <正文：你的审计输出——目标推导 + 独立核实 + 逐条判定 + 总评，多行原样；末尾按「泛化发现与复查」附泛化 section，无则省略>
 ```
 
-真实审计（决策/产物）必写；轻量退出（低价值窗口）写 `low-value` 简短条目（无正文）；纯咨询**不写**（零噪音）。**audit-log ≥ 30KB 落盘豁免（v1.0.60 修正：不用 write 落盘，扩展会原子补写）**：文件 ≥ 30KB 时**禁止 write 触碰 audit-log**（全量重建压缩风险）——你只需把结论写进 state.json（signature/blockers/auditFindings），扩展会在审计完成时用 appendAuditReport（tmp+rename 原子写）补写元数据条目，证明链无空洞。写完报告再写签名——报告是证明链主体，签名是结论；先报告后签名保证你被杀时报告仍在。**证明缺口自查（顺手）**：写报告前对账三处（chain.md 新增决策 vs audit-log 最新条目 / 上轮 interrupted 是否补填 / blocked 是否闭环），发现的缺口写进报告正文，严重者升级为 blocker。
+真实审计（决策/产物）必写；轻量退出（低价值窗口）写 `low-value` 简短条目（无正文）；纯咨询**不调用**（零噪音）。扩展已原子实现落盘，**无 ≥30KB 豁免**——任何大小都直接调工具，正文绝不丢失；被强杀时扩展的 `backfillAuditLogIfNeeded` 仍会基于 state 的 auditFindings/blockers 兜底补写正文。写完报告再写签名——报告是证明链主体，签名是结论；先报告后签名保证你被杀时报告已在。**证明缺口自查（顺手）**：写报告前对账三处（chain.md 新增决策 vs audit-log 最新条目 / 上轮 interrupted 是否补填 / blocked 是否闭环），发现的缺口写进报告正文，严重者升级为 blocker。
 
 **泛化发现与复查（v1.0.48c，pair 的多头注意力沉淀）**：泛化发现 = 发散核实的路径型产出（主 agent 没想到的候选路径，非缺陷）：
 

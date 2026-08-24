@@ -54,6 +54,7 @@ import {
 	shouldClearStaleLock,
 	shouldInjectInterimFindings,
 	shouldInjectSignatureFindings,
+	classifyAuditTrigger,
 	patchAuditState,
 	writeAuditState,
 } from "../lib/chain-store.js";
@@ -723,10 +724,12 @@ test("接线守卫：目标架构（单层审计 + fresh spawn + L2 门禁 + 价
 			!agentSrc.includes("ctx_ls"),
 		"审计者 agent 工具白名单不得含 ctx_*（未加载扩展，运行时拒绝致 run exitCode=1）",
 	);
-	// v1.0.48：证明链（报告落盘 + subagent 转述捕获 + 缺口自查 + 超时补写）
+	// v1.0.48/v1.0.86 源头版：证明链（报告落盘）——报告经确定性 audit_report_append
+	// 工具落盘（扩展原子写，不再依赖 LLM write 全量重建 audit-log；无 ≥30KB 豁免）
 	assert.ok(
-		src.includes("auditLogPath(cwd)"),
-		"审计任务必须注入 audit-log 路径（报告落盘指令）",
+		src.includes("audit_report_append") &&
+			src.includes("禁止用 write 全量重建 audit-log"),
+		"审计任务必须改用 audit_report_append 确定性落报告（替代 LLM write 全量重建）",
 	);
 	assert.ok(
 		src.includes("subagent 决策捕获"),
@@ -892,8 +895,9 @@ test("接线守卫：目标架构（单层审计 + fresh spawn + L2 门禁 + 价
 		"审计任务必须引导泛化发现沉淀到 gaps.md（audit-log 豁免不殃及泛化通道）",
 	);
 	assert.ok(
-		src.includes("扩展会在审计完成时用 appendAuditReport"),
-		"任务文本必须说明豁免补写由扩展原子执行（write 触碰禁令）",
+		src.includes("audit_report_append") &&
+			src.includes("backfillAuditLogIfNeeded"),
+		"任务文本须改用确定性 audit_report_append 落报告，扩展 backfillAuditLogIfNeeded 作被强杀兜底",
 	);
 	assert.ok(
 		agentSrc.includes("gaps.md") && agentSrc.includes("独立原语库"),
@@ -906,8 +910,9 @@ test("接线守卫：目标架构（单层审计 + fresh spawn + L2 门禁 + 价
 	);
 	// v1.0.62：agent 协议双点同步（reviewer Medium-High——v1.0.52→53 事故同类）
 	assert.ok(
-		agentSrc.includes("扩展会在审计完成时用 appendAuditReport"),
-		"agent 协议必须同步 v1.0.60 豁免语义（禁止 write 触碰 + 扩展原子补写）",
+		agentSrc.includes("audit_report_append") &&
+			agentSrc.includes("backfillAuditLogIfNeeded"),
+		"agent 协议必须同步源头版语义（audit_report_append 确定性落报告 + 扩展兜底补写）",
 	);
 	// v1.0.63：补写双保险（事件 + 轮询）
 	assert.ok(
@@ -961,6 +966,31 @@ test("appendAuditReport：append-only + 字段渲染 + 与 chain 同目录", () 
 	assert.ok(raw.includes("- Blockers: 无"), "空 blockers 必须渲染为'无'");
 	assert.ok(raw.includes("- RunId: run-2"), "RunId 字段必须渲染");
 	assert.ok(raw.includes("偏离 ✗"), "正文必须原样保留");
+});
+
+test("appendAuditReport：id 唯一且可解析（身份键不变量，防重复 id 静默丢条目）", () => {
+	const dir = tmpDir();
+	// 身份键必须唯一：同毫秒内两次调用（同进程并发补写 / 跨进程审计者+扩展）若仅用
+	// Date.now() 会得重复 id —— 下游靠 AUDIT-<...> 身份推导（parseAuditLog 末尾验证、
+	// backfill 匹配、queryGaps latest），重复 id 会误判甚至 last-writer-wins 静默丢条目。
+	// 现 id = AUDIT-<ms>-<pid>-<rand>，同毫秒必唯一；解析正则已放宽到 AUDIT-[\w-]+。
+	const realNow = Date.now;
+	const FROZEN = 1700000000000;
+	Date.now = () => FROZEN; // 冻结时钟，强制同毫秒碰撞场景
+	const id1 = appendAuditReport(dir, {
+		verdict: "passed", head: "abc", window: "w", blockers: [], runId: "run-1", body: "one",
+	});
+	const id2 = appendAuditReport(dir, {
+		verdict: "blocked", head: "def", window: "w", blockers: ["x"], runId: "run-2", body: "two",
+	});
+	Date.now = realNow;
+	assert.notEqual(id1, id2, "同毫秒 id 必须唯一（pid+random 后缀）");
+	assert.ok(id1.startsWith("AUDIT-"), "id 仍以 AUDIT- 开头");
+	assert.ok(id2.startsWith("AUDIT-"), "id 仍以 AUDIT- 开头");
+	const recs = readAuditLog(dir);
+	assert.equal(recs.length, 2, "两条报告均落盘（无重复 id 吞条目）");
+	assert.equal(recs[0].id, id1, "解析身份键与落盘 id 一致");
+	assert.equal(recs[1].id, id2, "解析身份键与落盘 id 一致");
 });
 
 test("readAuditState 读侧自愈：截断补全 + .corrupt 备份恢复（v1.0.48）", () => {
@@ -1531,6 +1561,11 @@ test("backfillAuditLogIfNeeded：双保险补写入口（v1.0.63）", () => {
 		entries5[0].blockers.length,
 		2,
 		"兜底派生 blockers 必须写入条目（auditFindings 过滤占位后全部）",
+	);
+	// v1.0.86（#1 修复）：补写条目正文必须含真实审计发现，不得是空壳元数据
+	assert.ok(
+		entries5[0].body.includes("缺口 X"),
+		"补写条目正文必须重建审计者真实 findings（≥30KB 豁免路径不丢推理）",
 	);
 	// v1.0.73（reviewer Medium）：泄漏型幂等——存在性检查用派生值后，重复调用不补
 	const s5b = readAuditState(dir5);
@@ -3514,4 +3549,142 @@ test("R5-F6: B5 兜底分支（at=0 + lastAuditAt）同享时钟容差", () => {
 		true,
 		"B5 分支同享容差（旧代码：严格比较 → 慢钟主机假超时 → 300s 降级覆盖真实结论）",
 	);
+});
+
+// ---- v1.0.85 用户视角修复接线守卫：7 条不友好行为 ----
+test("接线守卫：v1.0.85 用户视角修复（结论形态/闲聊轮/节流/失败可见/落盘开关/警告去重）", () => {
+	const src = fs.readFileSync(
+		path.join(process.cwd(), "extensions", "decision-chain.ts"),
+		"utf-8",
+	);
+	const lib = fs.readFileSync(
+		path.join(process.cwd(), "lib", "chain-store.ts"),
+		"utf-8",
+	);
+	// #1：审计结论不再伪装用户消息——blocked 交付必须走 sendMessage customType（系统形态），
+	// 不得再用 sendUserMessage 的 followUp（user 形态 → agent 误以为用户指令）
+	assert.ok(
+		src.includes('deliverAs: "followUp"') &&
+			src.includes("pi.sendMessage(") &&
+			src.includes("pi-pair-audit-findings"),
+		"#1 审计结论必须以 customType 系统消息交付（pi.sendMessage + pi-pair-audit-findings），不得伪装用户消息",
+	);
+	assert.ok(
+		!src.includes("pi.sendUserMessage(`结对审计发现缺口"),
+		"#1 不得再用 sendUserMessage 注入审计结论（user 形态 = 假用户指令）",
+	);
+	// #3：闲聊轮不烧审计——hasWork 的未提交改动分支必须受本轮工具调用计数约束
+	assert.ok(
+		src.includes("roundToolCalls") &&
+			src.includes('pi.on("tool_execution_start"') &&
+			src.includes("hasUncommittedChanges(root) && toolsThisRound > 0"),
+		"#3 未提交改动单独不触发审计——需本轮有代码工具调用（tool_call 计数）",
+	);
+	// #4：findings 弹窗节流——同轮审计只 notify 首条真实 findings
+	assert.ok(
+		src.includes("findingsNotifiedOnce"),
+		"#4 findings notify 必须节流（同轮只通知首条，后续只更新呼吸灯计数）",
+	);
+	// #5：失败必通知——三条失败路径（spawn 失败无提交轮 / run 异常无签名 / 门禁超时降级）
+	// 统一含「审计未完成」文案的 notify
+	const failNotices = src.match(/审计未完成/g) ?? [];
+	assert.ok(
+		failNotices.length >= 3,
+		`#5 失败路径必须有 ≥3 处「审计未完成」通知（spawn 失败/run 异常/门禁超时），实际 ${failNotices.length} 处`,
+	);
+	// #7：对话落盘开关——appendConv 必须受 PI_PAIR_CONVLOG 控制
+	assert.ok(
+		src.includes("PI_PAIR_CONVLOG"),
+		"#7 convlog 写入必须支持 PI_PAIR_CONVLOG=0 关闭（对话持久化知情 + 控制）",
+	);
+	// #8：多实例警告去重——每 root 每会话只弹一次
+	assert.ok(
+		src.includes("multiInstanceWarned"),
+		"#8 多实例 warning 必须去重（每 root 每会话一次）",
+	);
+	// #6：触发词写死词表——lib 必须用固定词表数组（REQUEST_WORDS/SKIP_WORDS/CANCEL_WORDS），
+	// 不用宽松正则（「审计」裸词误触发面）
+	assert.ok(
+		lib.includes("REQUEST_WORDS") &&
+			lib.includes("SKIP_WORDS") &&
+			lib.includes("CANCEL_WORDS") &&
+			!lib.includes('"审计"'),
+		"#6 触发词必须写死为固定词表数组（REQUEST_WORDS/SKIP_WORDS/CANCEL_WORDS），宽松正则全部干掉",
+	);
+});
+
+// ---- 用户输入触发词分类（v1.0.84）----
+test("触发词：请求审计（只认明确请求组合，「审计」裸词不触发）", () => {
+	for (const p of [
+		"审一下",
+		"帮我审",
+		"帮我审计一下这个决定",
+		"帮我审计",
+		"审计一下",
+		"审计这个方案",
+		"审计我的改动",
+		"审一审",
+		"pair audit",
+		"audit my work",
+		"audit the decisions",
+	]) {
+		assert.equal(classifyAuditTrigger(p), "request", p);
+	}
+	// 收紧（v1.0.85）：裸「审计」可能出现在「审计日志/审计跟踪/审计配置」等名词语境，
+	// 误触发 = 后台烧钱；漏触发成本低（用户补一句「帮我审计」即可）
+	for (const p of ["审计", "审计日志", "审计配置", "把审计逻辑改一下"]) {
+		assert.equal(classifyAuditTrigger(p), null, p);
+	}
+});
+
+test("触发词：豁免自动审计", () => {
+	for (const p of [
+		"不用审",
+		"别审",
+		"别审计了",
+		"跳过审计",
+		"不审计",
+		"先不审",
+		"不用审计",
+		"免审",
+		"无需审计",
+		"不用再审",
+		"skip audit",
+		"no audit please",
+	]) {
+		assert.equal(classifyAuditTrigger(p), "skip", p);
+	}
+});
+
+test("触发词：取消在跑审计", () => {
+	for (const p of [
+		"取消审计",
+		"停掉审计",
+		"停止审计",
+		"终止审计",
+		"别审了",
+		"cancel audit",
+		"stop audit",
+	]) {
+		assert.equal(classifyAuditTrigger(p), "cancel", p);
+	}
+});
+
+test("触发词：优先级 cancel > skip > request（同轮多条命中取最高）", () => {
+	assert.equal(classifyAuditTrigger("不用审，帮我审一下"), "skip");
+	assert.equal(classifyAuditTrigger("取消审计，不用再审了"), "cancel");
+	assert.equal(classifyAuditTrigger("别审了，帮我审一下"), "cancel");
+	assert.equal(classifyAuditTrigger("别审了"), "cancel"); // 在跑=取消，没跑=本轮豁免
+});
+
+test("触发词：无关输入不触发", () => {
+	for (const p of [
+		"继续",
+		"改一下这个 bug",
+		"把测试跑绿",
+		"今天天气不错",
+		"",
+	]) {
+		assert.equal(classifyAuditTrigger(p), null, p);
+	}
 });

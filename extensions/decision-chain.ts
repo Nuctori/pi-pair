@@ -44,9 +44,11 @@ import {
 	shouldClearStaleLock,
 	shouldInjectInterimFindings,
 	shouldInjectSignatureFindings,
+	classifyAuditTrigger,
 	patchAuditState,
 	writeAuditReport,
 	auditReportPath,
+	type AuditTrigger,
 } from "../lib/chain-store.js";
 // ---- pi-subagents RPC 通道（进程内事件总线）----
 const RPC_READY = "subagents:rpc:v1:ready";
@@ -312,7 +314,7 @@ function buildIncrementalAuditTask(cwd: string, runId: string): string {
 	lines.push("");
 	lines.push("【输出】逐条判定（一致 ✓ / 偏离 ✗ / 需裁决 ⚠）+ 产物总评。");
 	lines.push(
-		`【报告落盘（证明链，先报告后签名）】写 signature **之前**，先把本轮审计报告 append 到 \`${auditLogPath(cwd)}\`（与 chain 同目录策略；write 纪律同 chain.md：read 全文 → content = 原文完整内容 + 新条目，一个字符不少，禁止整体重写）。条目格式：\`## AUDIT-<epoch ms>: <passed|blocked|low-value>\`，字段 Verdict / Head（= \`git rev-parse HEAD\` 全哈希）/ Window（审计窗口概述：决策范围+提交+未提交文件）/ Blockers（无则'无'）/ RunId（= state.json 的 auditRunId）/ Date（ISO），空行后附正文 = 你的审计输出（目标推导+独立核实+逐条判定+总评，多行原样）。真实审计必写；轻量退出写 \`low-value\` 简短条目；纯咨询**不写**（零噪音）。**audit-log ≥ 30KB 落盘豁免（v1.0.60 修正：不用 write 落盘，扩展会原子补写）**：文件 ≥ 30KB 时**禁止 write 触碰 audit-log**（全量重建压缩风险）——你只需把结论写进 state.json（signature/blockers/auditFindings），扩展会在审计完成时用 appendAuditReport（tmp+rename 原子写）补写元数据条目，证明链无空洞。写完报告再写签名——报告是证明链主体，签名是结论；先报告后签名保证你被杀时报告仍在。`,
+		`【报告落盘（证明链，先报告后签名）】写 signature **之前**，用 \`audit_report_append\` 工具把本轮审计报告确定性追加到审计日志（扩展原子写，不读不写整个文件——**禁止用 write 全量重建 audit-log**，30KB+ 文件全量重建有压缩/出错风险）。verdict 取 passed/blocked/low-value；head = \`git rev-parse HEAD\` 全哈希；window = 审计窗口概述（决策范围+提交+未提交文件）；blockers = 具体可操作缺口（blocked 时）；body = 你的审计输出（目标推导+独立核实+逐条判定+总评，多行原样）。真实审计必写；轻量退出写 \`low-value\`（无 body）；纯咨询**不调用**。扩展已原子实现落盘，无 ≥30KB 豁免——任何大小都直接调工具，正文绝不丢失。写完报告再写签名——报告是证明链主体，签名是结论；先报告后签名保证你被杀时报告已在。`,
 	);
 	lines.push(
 		"【证明缺口自查（顺手，不额外 spawn）】写报告前用 read 对账（gap 分析是 AI 能力，不依赖工具）：① chain.md 中 Date 晚于 audit-log 最新条目 Date 的 D-NNN = 决策未审，报告正文记录（非本轮窗口的存量缺口，仅记录不升级）；② audit-log 最近条目为 interrupted（上轮超时降级）→ 本轮报告注明『上轮中断，本轮补填』；③ blocked 后无新条目 = 上轮缺口未闭环，修复轮按【上轮缺口核对】核验即可。",
@@ -587,12 +589,35 @@ function stopAuditBreath(cwd?: string): void {
 const findingsObservers = new Map<string, ReturnType<typeof setInterval>>();
 const lastFindingsJson = new Map<string, string>();
 const findingsCount = new Map<string, number>();
+// v1.0.85（#4）：同轮审计只 notify 首条真实 findings——后续只更新呼吸灯计数，
+// 防审计者快速产出时逐条弹窗刷屏。观察器 stop 时清除（下轮审计重新计）。
+const findingsNotifiedOnce = new Map<string, boolean>();
 /** 连续读到 inFlight=false 的次数（Low-2：防瞬时读失败误自停） */
 const idleTicks = new Map<string, number>();
 
 function findingsObserverTick(ui: ExtensionUIContext, root: string): void {
 	try {
 		const st = readAuditState(root);
+		// F-15（v1.0.84）：TTL 超龄灭灯兜底——审计者 run 异常终止（崩溃/provider 报错）且
+		// async-complete 事件丢失或 runId 匹配失败时，state.inFlight 残留 true：观察器
+		// inFlight=false 判据永不成立（空转）；async-complete 的 TTL 兜底只在事件到达那一刻
+		// 执行一次（事件早到、TTL 未过期 → 之后无触发源）；agent_end deadAuditor 需 stopRun
+		// 成功才灭灯——三条事件/轮次依赖通道全失效时灯常亮（实证 4387s ≈ 73min）。
+		// 同语义）→ 删内存条目 + 停观察 + 灭灯。run 回收不在此做（见下：stop 通道
+		// 在工厂内不可见）；残留文件锁由 agent_end shouldClearStaleLock 兜底。
+		const breathRec = inFlightAudits.get(root);
+		if (
+			breathRec &&
+			performance.now() - breathRec.startedAt > IN_FLIGHT_TTL_MS
+		) {
+			inFlightAudits.delete(root);
+			// run 回收不在此做：scheduleOrphanStop/stopRun 在工厂内不可见（观察器是
+			// 模块级）；且本兜底命中时 run 大概率已死（事件通道失效场景），残留 run
+			// 由 agent_end deadAuditor / session_shutdown 既有通道 stop。
+			stopFindingsObserver(root);
+			stopAuditBreath(root);
+			return;
+		}
 		// 连续 3 次 inFlight=false 才自停（reviewer Low-2：瞬时读失败返回 DEFAULT
 		// 时 inFlight 恒 false，单次即停会永久丢失本轮可观察性）
 		if (!st.inFlight) {
@@ -622,14 +647,19 @@ function findingsObserverTick(ui: ExtensionUIContext, root: string): void {
 		if (realCount > 0) findingsCount.set(root, realCount);
 		if (json !== lastFindingsJson.get(root) && !isPlaceholder) {
 			lastFindingsJson.set(root, json);
-			const clip = last.length > 60 ? last.slice(0, 60) + "…" : last;
-			try {
-				ui.notify(
-					UI_LANG === "en" ? `pair audit: ${clip}` : `结对审计中：${clip}`,
-					"info",
-				);
-			} catch {
-				/* print/无 UI 模式降级 */
+			// v1.0.85（#4）：节流——同轮只 notify 首条（价值可见），后续由呼吸灯
+			// 「已发现 N 项」计数承接，防逐条弹窗刷屏
+			if (!findingsNotifiedOnce.get(root)) {
+				findingsNotifiedOnce.set(root, true);
+				const clip = last.length > 60 ? last.slice(0, 60) + "…" : last;
+				try {
+					ui.notify(
+						UI_LANG === "en" ? `pair audit: ${clip}` : `结对审计中：${clip}`,
+						"info",
+					);
+				} catch {
+					/* print/无 UI 模式降级 */
+				}
 			}
 		}
 	} catch {
@@ -662,6 +692,7 @@ function stopFindingsObserver(root?: string | null): void {
 			findingsCount.delete(root);
 			lastFindingsJson.delete(root);
 			idleTicks.delete(root); // reviewer Low：残留计数会让下轮首个 tick 误自停
+			findingsNotifiedOnce.delete(root); // v1.0.85（#4）：下轮审计重新计首条
 		}
 		return;
 	}
@@ -670,6 +701,7 @@ function stopFindingsObserver(root?: string | null): void {
 	findingsCount.clear();
 	lastFindingsJson.clear();
 	idleTicks.clear();
+	findingsNotifiedOnce.clear(); // v1.0.85（#4）
 }
 
 export default function (pi: ExtensionAPI): void {
@@ -791,6 +823,10 @@ export default function (pi: ExtensionAPI): void {
 			}
 			// 决策信号清零（FP 审计 #3：print 模式 agent_end 可能不执行，防跨会话残留误触发）
 			roundDecisionMade = false;
+			// 触发词信号清零（v1.0.84，同 FP #3 模式）
+			userAuditTrigger = null;
+			// 工具调用计数清零（v1.0.85，同 FP #3 模式）
+			roundToolCalls = 0;
 			// 交付门禁基线：会话起始 HEAD（非 git 仓库 → 无门禁）；持久化——
 			// 扩展热重载（/reload / pi install）不重发 session_start，内存基线丢失后
 			// 惰性初始化从 state 恢复（v1.0.23：防热重载把刚提交的修复吞成基线）
@@ -1027,6 +1063,83 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 
+	// ---- 工具：audit_report_append（审计者落报告，确定性原子 append）----
+	// 源头版修复（v1.0.86 续）：替代审计者用 write 全量重建 audit-log 的 LLM 纪律——
+	// 全量重建在 ≥30KB 时有压缩/出错风险（v1.0.60 因此设豁免、把正文推给 LLM 守纪律，
+	// 根因是"依赖 LLM 不犯错"）。本工具内部直接调 appendAuditReport（mtime 乐观锁 +
+	// 唯一 tmp 原子写 + rename 紧前复校验 + 写后验证），审计者只传结构化字段，不读不写
+	// 整个文件。runId 取 state.auditRunId，与 backfillAuditLogIfNeeded 判据同源 → 幂等。
+	// 仅审计者流程使用（prompt 教它用）；主会话一般走 decision_add/signoff。
+	pi.registerTool({
+		name: "audit_report_append",
+		label: "Audit Report Append",
+		description:
+			"把本轮审计报告确定性追加到 audit-log（扩展原子写，不读不写整个文件）。" +
+			"审计者落报告的唯一通道：传 verdict/head/blockers/body，替代 write 全量重建（≥30KB 无压缩风险）。" +
+			"真实审计用 passed/blocked；轻量退出用 low-value（无 body）；纯咨询不调用。",
+		parameters: Type.Object({
+			verdict: Type.Union(
+				[
+					Type.Literal("passed"),
+					Type.Literal("blocked"),
+					Type.Literal("low-value"),
+				],
+				{ description: "passed=通过；blocked=有缺口；low-value=轻量退出" },
+			),
+			head: Type.String({
+				description: "git rev-parse HEAD 全哈希（审计基线）",
+			}),
+			window: Type.Optional(
+				Type.String({
+					description: "审计窗口概述（决策范围+提交+未提交文件）",
+				}),
+			),
+			blockers: Type.Optional(
+				Type.Array(Type.String(), {
+					description: "blocked 时的具体可操作缺口",
+				}),
+			),
+			body: Type.Optional(
+				Type.String({
+					description: "报告正文（目标推导+独立核实+逐条判定+总评，多行）",
+				}),
+			),
+		}),
+		async execute(toolCallId, params, signal, onUpdate, ctx) {
+			const root = projectRoot(ctx.cwd);
+			try {
+				const runId = readAuditState(root).auditRunId;
+				const id = appendAuditReport(root, {
+					verdict: params.verdict,
+					head: params.head ?? "",
+					window: params.window ?? "",
+					blockers: params.blockers ?? [],
+					runId,
+					body: params.body ?? "",
+				});
+				return {
+					content: [
+						{
+							type: "text",
+							text: `已追加审计报告 ${id} (${params.verdict}) → ${auditLogPath(root)}`,
+						},
+					],
+					details: { id },
+				};
+			} catch (err) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `审计报告落盘失败: ${err instanceof Error ? err.message : String(err)}`,
+						},
+					],
+					details: { error: true },
+				};
+			}
+		},
+	});
+
 	// ---- 工具：pair_gaps（查询证明缺口 + 泛化缺口，审计者与主会话共用）----
 	pi.registerTool({
 		name: "pair_gaps",
@@ -1239,10 +1352,18 @@ export default function (pi: ExtensionAPI): void {
 			/* noop */
 		}
 	};
-	// 本轮决策信号（decision_add 调用置位，agent_end 消费）——对话增量触发审计的门控
-	// 会话级（非模块级）：session_start 清零（print 模式 agent_end 可能不执行，
-	// 标志残留跨会话会误触发下轮 spawn——FP 审计 #3）
 	let roundDecisionMade = false;
+	// 本轮用户输入触发词（before_agent_start 从 event.prompt 分类置位，agent_end 消费）——
+	// "request"=强制审计、"skip"=本轮豁免、"cancel"=取消在跑审计（含 skip 语义）。
+	// 会话级（同 roundDecisionMade）：session_start 清零，防跨会话残留误触发（FP #3 模式）。
+	let userAuditTrigger: AuditTrigger | null = null;
+	// 本轮代码工具调用计数（tool_call 事件置位，agent_end 消费）——v1.0.85：
+	// hasUncommittedChanges 单独不触发审计（历史脏工作区 ≠ 本轮有工作），
+	// 需本轮有代码类工具调用（edit/write/bash 等）才因未提交改动 spawn。
+	// 会话级（同 roundDecisionMade）：session_start 清零，防跨会话残留误触发。
+	let roundToolCalls = 0;
+	// 多实例 warning 去重（v1.0.85，#8）：每 root 每会话只弹一次（nonGitRootWarned 模式）
+	const multiInstanceWarned = new Set<string>();
 	// 非 git 根守卫去重：每个根每会话只警告一次（避免每轮 decision 轮重复刷屏）
 	const nonGitRootWarned = new Set<string>();
 	// ---- findings 注入去重：两个独立 map 防互相覆盖（D1）----
@@ -1257,8 +1378,36 @@ export default function (pi: ExtensionAPI): void {
 		try {
 			const root = projectRoot(ctx.cwd);
 			const state = readAuditState(root);
-			// v1.0.74（reviewer M2 根因）：审计者 LLM 换算 at 常错 +10min → 下轮窗口起点
-			// 未来 → 系统性漏审路径。每轮起点钳制未来签名 at（审计者 spawn 前修正落盘）。
+			// ---- 用户输入触发词（v1.0.84）：显式意图机械判定，优先级 cancel > skip > request ----
+			// event.prompt = 用户原始输入（expansion 后）。cancel 立即异步 stop 在跑审计
+			// （不阻塞 agent 启动；身份守卫 F-02 模式：仅内存条目存在且 stopRun 成功才清
+			// 文件锁——无条目时留给 agent_end stale 机制，不盲清防双实例）；skip/cancel
+			// 均置位让 agent_end 本轮豁免（request 强制审计）。分类逻辑在 lib 有行为测试。
+			const trigger = classifyAuditTrigger(event.prompt ?? "");
+			if (trigger !== null) {
+				userAuditTrigger = trigger;
+				if (trigger === "cancel") {
+					const rec = inFlightAudits.get(root);
+					const cancelRunId = rec?.runId ?? "";
+					void (async () => {
+						try {
+							const stopped = cancelRunId ? await stopRun(cancelRunId) : false;
+							if (stopped && inFlightAudits.get(root)?.runId === cancelRunId) {
+								inFlightAudits.delete(root);
+								try {
+									patchAuditState(root, { inFlight: false });
+								} catch {
+									/* noop */
+								}
+							}
+							stopAuditBreath(root);
+							ctx.ui.notify("结对审计已按你的要求取消。", "info");
+						} catch {
+							/* noop：取消失败不影响本轮（agent_end 既有机制兜底） */
+						}
+					})();
+				}
+			}
 			try {
 				clampFutureSignatureAt(root, state);
 			} catch {
@@ -1468,6 +1617,13 @@ export default function (pi: ExtensionAPI): void {
 			// 本轮决策信号消费（decision_add 置位）——对话增量触发审计的门控
 			const decisionThisRound = roundDecisionMade;
 			roundDecisionMade = false;
+			// 本轮用户输入触发词消费（before_agent_start 置位）——request 强制审计 /
+			// skip+cancel 豁免本轮（v1.0.84）
+			const triggerThisRound = userAuditTrigger;
+			userAuditTrigger = null;
+			// 本轮工具调用计数消费（v1.0.85，#3）：未提交改动 + 本轮没动手 = 不审
+			const toolsThisRound = roundToolCalls;
+			roundToolCalls = 0;
 			// 交付门禁 = 本轮产生了 git 提交（HEAD ≠ 上次门禁覆盖的 HEAD）——
 			// 客观信号，无词表/模式匹配（完工语义判断不可靠，v1.0.17 先例）；
 			// 问句/任意措辞天然免疫（不产生提交就不触发）
@@ -1496,13 +1652,18 @@ export default function (pi: ExtensionAPI): void {
 				// 17006s」≈4.7h）。return 前灭自己的灯（cwd 校验隔离多实例，不误灭他人灯）；
 				// 不动 state——多实例下 state 可能属另一实例的真实审计（L4 防护不变）。
 				stopAuditBreath(root);
-				try {
-					ctx.ui.notify(
-						"⚠ 检测到同一 cwd 下多个 pi 实例共享 convlog（存在其他实例的真实对话），本轮自动审计已跳过——多实例场景下审计会错审。在不同目录运行或设 PI_PAIR_PROJECT_ROOT 指向单一项目根后恢复。",
-						"warning",
-					);
-				} catch {
-					/* print/无 UI 模式降级 */
+				// v1.0.85（#8）：去重——每 root 每会话只弹一次（nonGitRootWarned 模式），
+				// 否则纯聊天轮每轮弹技术性 warning
+				if (!multiInstanceWarned.has(root)) {
+					multiInstanceWarned.add(root);
+					try {
+						ctx.ui.notify(
+							"⚠ 检测到同一 cwd 下多个 pi 实例共享 convlog（存在其他实例的真实对话），本轮自动审计已跳过——多实例场景下审计会错审。在不同目录运行或设 PI_PAIR_PROJECT_ROOT 指向单一项目根后恢复。",
+							"warning",
+						);
+					} catch {
+						/* print/无 UI 模式降级 */
+					}
 				}
 				return;
 			}
@@ -1575,11 +1736,14 @@ export default function (pi: ExtensionAPI): void {
 				patchAuditState(root, { lastError: null });
 			}
 			const hasWork =
-				hasUncommittedChanges(root) ||
+				// v1.0.85（#3）：未提交改动需本轮有代码工具调用（历史脏工作区不因聊天轮 spawn）
+				(hasUncommittedChanges(root) && toolsThisRound > 0) ||
 				hasNewCommit ||
 				state.signature?.status === "failed" ||
 				(hasNewConversation(root, clampConvExtractedLine(root)) &&
-					decisionThisRound);
+					decisionThisRound) ||
+				// 用户请求词（v1.0.84）：无产物/无决策的轮也强制审计（等价 /pair-audit）
+				triggerThisRound === "request";
 			// F5（v1.0.29 双审计）：failed 重试轮（上次 spawn 失败、本轮无未提交产物）
 			// 是「补审」不是「交付」——不得升级为 300s 门禁轮询（failed 不推进
 			// gatedHead → hasNewCommit 持续为真 → 纯聊天轮也 spawn + 门禁轮询 300s，
@@ -1591,6 +1755,13 @@ export default function (pi: ExtensionAPI): void {
 			// 「无未提交产物」：已提交内容在审计窗口内（git log --since）仍会被审。
 			const failedRetry =
 				state.signature?.status === "failed" && !hasUncommittedChanges(root);
+			// 用户豁免（skip/cancel，v1.0.84）：本轮不 spawn（含 L2 交付审查）——
+			// 放 hasWork 判定**之前**：有提交/有产物的轮豁免也生效。gatedHead 不推进
+			// → 未覆盖提交下轮自然补审（豁免是单轮语义，非永久关闭）。cancel 的 stop
+			// 已在 before_agent_start 异步执行，这里只保证本轮不 spawn。
+			if (triggerThisRound !== null && triggerThisRound !== "request") {
+				return;
+			}
 			if (!hasWork) return;
 
 			// 非 git 根守卫（跨项目串台源头，v1.0.24）：自动解析退化为非 git 目录（典型：
@@ -1668,7 +1839,12 @@ export default function (pi: ExtensionAPI): void {
 				});
 				try {
 					await readyPromise;
-					const task = buildIncrementalAuditTask(root, RUN_ID);
+					// 用户请求词触发（v1.0.84）：等价 /pair-audit 无参数全量审计；
+					// 否则默认增量审本轮新决策
+					const task =
+						triggerThisRound === "request"
+							? buildAuditTask(root, {}, RUN_ID)
+							: buildIncrementalAuditTask(root, RUN_ID);
 					// fresh spawn（不常驻）+ context:"fork" 继承主会话上下文——
 					// 审计者理解"同一会话"在做什么，而非从零开始
 					const result = await rpc<{ runId?: string; asyncId?: string }>(
@@ -1768,6 +1944,16 @@ export default function (pi: ExtensionAPI): void {
 						try {
 							ctx.ui.notify(
 								"⚠ 本轮有提交但审计 spawn 失败（产物未过审），已标记 failed 下轮自动重试；缺口仍保留在 state.json。",
+								"warning",
+							);
+						} catch {
+							/* print/无 UI 模式降级 */
+						}
+					} else {
+						// v1.0.85（#5）：失败必通知——无提交常规轮 spawn 失败此前静默
+						try {
+							ctx.ui.notify(
+								"审计未完成：审计者 spawn 失败（本轮无提交），已标记 failed 下轮自动重试。",
 								"warning",
 							);
 						} catch {
@@ -1927,6 +2113,15 @@ export default function (pi: ExtensionAPI): void {
 						gatedHead.set(root, head);
 						persistGatedHead(root, head);
 						stopAuditBreath(); // 超时降级：灯灭
+						// v1.0.85（#5）：失败必通知——门禁超时降级此前完全静默
+						try {
+							ctx.ui.notify(
+								"审计未完成：门禁超时（300s）已降级放行——已确认发现将注入下轮，或 /pair-audit 重审。",
+								"warning",
+							);
+						} catch {
+							/* print/无 UI 模式降级 */
+						}
 						return;
 					}
 				} catch {
@@ -1999,15 +2194,24 @@ export default function (pi: ExtensionAPI): void {
 			runId?: string;
 			success?: boolean;
 		} | null;
-		const completedId = env?.runId ?? env?.asyncId ?? "";
+		const eventRunId = env?.runId ?? "";
+		const eventAsyncId = env?.asyncId ?? "";
+		const completedId = eventRunId || eventAsyncId;
 		// L2 reviewer run 完成即移除（T1 补漏）：Set 只保留挂起 run，session_shutdown 有界
 		if (completedId) {
 			deliveryReviewerRuns.delete(completedId);
 			cancelOrphanStop(completedId); // F4/B-2：run 已自然完成，取消孤儿定时器
 		}
 		let completedCwd: string | null = null;
+		// F-15（v1.0.84）：双 id 匹配加固——spawn 存的是 `result.runId ?? result.asyncId`
+		// 单值，事件 payload 的 runId/asyncId 字段可能互缺（失败路径字段不一致）→ 单 id
+		// 比对失败时 completedCwd=null，灭灯走不到（实证 4387s）。runId 与 asyncId 任一
+		// 命中即认；观察器 TTL 兜底仍在，双保险。
 		for (const [cwd, rec] of inFlightAudits) {
-			if (completedId && rec.runId === completedId) {
+			if (
+				completedId &&
+				(rec.runId === eventRunId || rec.runId === eventAsyncId)
+			) {
 				inFlightAudits.delete(cwd);
 				completedCwd = cwd;
 			}
@@ -2062,6 +2266,17 @@ export default function (pi: ExtensionAPI): void {
 					} catch {
 						/* print/无 UI 模式降级 */
 					}
+				} else if (env?.success === false && completedCwd) {
+					// v1.0.85（#5）：失败必通知——run 异常终止且未写签名（此前静默，
+					// 用户只看到灯灭/下轮「被中断审计」惊悚注入）
+					try {
+						uiBeforeStop?.notify(
+							"审计未完成：审计者 run 异常终止且未完成签名——下轮自动补审，或 /pair-audit 手动触发。",
+							"warning",
+						);
+					} catch {
+						/* print/无 UI 模式降级 */
+					}
 				}
 				if (
 					st.signature?.status === "blocked" &&
@@ -2078,9 +2293,18 @@ export default function (pi: ExtensionAPI): void {
 					// followUp + 注入双通道重复。
 					let delivered = false;
 					try {
-						pi.sendUserMessage(
-							`结对审计发现缺口（请处理，处理后下轮自动再审）：\n${st.signature.blockers.map((b) => `- ${b}`).join("\n")}`,
-							{ deliverAs: "followUp" },
+						// v1.0.85（#1）：审计结论以 customType **系统消息**交付（pi.sendMessage），
+						// 不再用 sendUserMessage 的 followUp（user 形态 → agent 误以为用户指令，
+						// 回复「按你的要求修复了」——用户没要求过）。triggerTurn 唤醒 agent
+						// 立即处理（审计缺口 = 交付缺陷，细化精度闭环），但 agent 知道这是
+						// 审计报告不是用户话语（SKILL 声明处理规则）。
+						pi.sendMessage(
+							{
+								customType: "pi-pair-audit-findings",
+								content: `结对审计发现缺口（系统审计报告，非用户消息——请立即处理，处理后下轮自动再审）：\n${st.signature.blockers.map((b) => `- ${b}`).join("\n")}`,
+								display: false,
+							},
+							{ triggerTurn: true, deliverAs: "followUp" },
 						);
 						delivered = true;
 					} catch {
@@ -2157,6 +2381,30 @@ export default function (pi: ExtensionAPI): void {
 		}
 	});
 
+	// ---- 本轮工具调用计数（v1.0.85，#3）：代码类工具（写入/执行）才算「本轮有工作」----
+	// 历史遗留的未提交改动（用户从别处拷贝的脏工作区）不因聊天轮触发审计——
+	// 闲聊轮零 spawn（D-006 语义扩展：零 spawn 从「纯咨询」扩展到「没动手」）
+	const CODE_TOOLS = new Set([
+		"edit",
+		"write",
+		"bash",
+		"shell",
+		"pwsh",
+		"patch",
+		"apply_patch",
+		"ctx_edit",
+		"ctx_patch",
+		"ctx_shell",
+	]);
+	pi.on("tool_execution_start", (event, ctx) => {
+		try {
+			const e = event as { toolName?: string } | null;
+			if (e?.toolName && CODE_TOOLS.has(e.toolName)) roundToolCalls++;
+		} catch {
+			/* noop */
+		}
+	});
+
 	// ---- 对话流日志：确定性记录用户提示与助手最终回复（不靠主 agent 自记）----
 	pi.on("message_end", (event, ctx) => {
 		try {
@@ -2164,13 +2412,20 @@ export default function (pi: ExtensionAPI): void {
 			if (!msg) return;
 			if (msg.role === "user") {
 				const text = extractText(msg.content);
-				if (text) appendConv(projectRoot(ctx.cwd), "user", text, RUN_ID);
+				// v1.0.85（#7）：对话落盘知情 + 控制——PI_PAIR_CONVLOG=0 关闭
+				// convlog 持久化（对话默认写入 .pi/decision-auditor/convlog.md
+				// 供审计者当证据源；关闭后审计者的对话上下文随之缺失）
+				if (text && process.env.PI_PAIR_CONVLOG !== "0") {
+					appendConv(projectRoot(ctx.cwd), "user", text, RUN_ID);
+				}
 				// 交付检测已删除：完工是语义判断，不用词表/模式匹配（v1.0.17 先例）；
 				// 门禁与 L2 改由 agent_end 的 git HEAD 变化（客观提交信号）触发
 			} else if (msg.role === "assistant") {
 				const text = extractText(msg.content);
 				if (text) {
-					appendConv(projectRoot(ctx.cwd), "assistant", text, RUN_ID);
+					if (process.env.PI_PAIR_CONVLOG !== "0") {
+						appendConv(projectRoot(ctx.cwd), "assistant", text, RUN_ID);
+					}
 					// 意图信号记录（高信号过滤，≤200 字符；PI_PAIR_PROCESS_LOG=0 关闭——CI 跑分基线用）
 					if (process.env.PI_PAIR_PROCESS_LOG !== "0") {
 						appendProcessSignal(projectRoot(ctx.cwd), text, RUN_ID);
