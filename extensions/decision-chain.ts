@@ -1371,6 +1371,13 @@ export default function (pi: ExtensionAPI): void {
 	const injectedSignatureAt = new Map<string, number>();
 	// 中间态注入去重（记录已注入的 auditStartedAt，同轮审计只注入一次）
 	const injectedInterimAt = new Map<string, number>();
+	// ---- 节流与禁止改前缀（缓存命中修复）----
+	// 禁止改前缀：默认不以 display:true 注入对话前缀（会破坏 prompt-cache 前缀稳定性）→ 改为文件+notify
+	// 显式 PI_PAIR_PREFIX_INJECTION=1 才恢复旧的注入行为（兼容旧流程）
+	const ALLOW_PREFIX_INJECTION = process.env.PI_PAIR_PREFIX_INJECTION === "1";
+	// 审计节流：同项目连续审计冷却窗，防 decision_add 风暴（16MB/70次/会话）把缓存与上下文撑爆
+	const AUDIT_THROTTLE_MS = Number(process.env.PI_PAIR_AUDIT_THROTTLE_MS ?? 180000);
+	const lastAuditSpawnAt = new Map<string, number>();
 
 	// ---- 产物交叉审计（agent_end）：本轮有真实产物 → spawn 审计者；交付轮后台轮询等签名，常规轮异步不阻塞 ----
 	// ---- findings 注入：上一轮审计的结论/中间态带给主 agent（低优先级，不阻塞）----
@@ -1564,11 +1571,30 @@ export default function (pi: ExtensionAPI): void {
 				if (interimTriggered) {
 					injectedInterimAt.set(root, state.auditStartedAt || Date.now()); // R5-F1（中间态孪生）
 				}
+				// 禁止改前缀：默认不注入对话（改前缀会破坏 prompt-cache）→ 写文件+notify；显式开关才注入
+				if (!ALLOW_PREFIX_INJECTION) {
+					try {
+						const report = [
+							"# 结对审计发现（同会话）",
+							"",
+							`- 审计完成：${new Date(state.signature?.at ?? Date.now()).toISOString()}`,
+							`- 生成会话：${RUN_ID}`,
+							"",
+							"## 结论与发现",
+							"",
+							...valueMsgs.join("\n\n").split("\n").map((l) => `> ${l}`),
+							"",
+						].join("\n");
+						if (!writeAuditReport(root, report)) return;
+					} catch { return; }
+					try { ctx.ui.notify(`结对审计发现已写入 ${auditReportPath(root)}，供随时查阅（已禁止前缀注入以保缓存命中）。`, "info"); } catch {}
+					return;
+				}
 				return {
 					message: {
 						customType: "pi-pair-findings",
 						content: valueMsgs.join("\n\n"),
-						display: true, // 审计抓出的价值点：用户必须感知（可观察）
+						display: true, // 显式开关才注入：默认禁止改前缀
 					},
 				};
 			}
@@ -1783,6 +1809,15 @@ export default function (pi: ExtensionAPI): void {
 				return; // 非 git 根：跳过自动审计（return 必须在 if 内——否则 git 根的 agent_end 也被短路）
 			}
 
+			// 审计节流：同项目冷却窗内跳过本轮审计（hasWork 仍保留，下轮冷却过期自动补——节流≠丢审计）
+			// request / failedRetry 补审不受节流；交付提交已落库，冷却过期仍会审到
+			{
+				const sinceLast = Date.now() - (lastAuditSpawnAt.get(root) ?? 0);
+				const failedRetry = state.signature?.status === "failed" && !hasUncommittedChanges(root);
+				const throttleExempt = triggerThisRound === "request" || failedRetry;
+				if (!throttleExempt && sinceLast < AUDIT_THROTTLE_MS) return;
+			}
+
 			// L2 交付审查（3 reviewer fanout）：与新提交同源触发（无词表——交付 = 客观提交信号）；
 			// v1.0.28（F-08）：传 head 做冷却键（同 HEAD 防重复，新 HEAD 允许重新 fanout）
 			if (hasNewCommit) {
@@ -1837,6 +1872,7 @@ export default function (pi: ExtensionAPI): void {
 					startedAt: performance.now(),
 					auditStartedAtWall: lockStartedAtWall,
 				});
+				lastAuditSpawnAt.set(root, Date.now());
 				try {
 					await readyPromise;
 					// 用户请求词触发（v1.0.84）：等价 /pair-audit 无参数全量审计；
