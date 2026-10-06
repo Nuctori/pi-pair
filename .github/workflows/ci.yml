@@ -77,7 +77,7 @@ jobs:
           EOF
           # opencode-cli 免费模型：无需 key、无需登录（opencode-pi 桥接）
           pi -p "$(cat prompt.txt)" --provider opencode-cli \
-            --model opencode/deepseek-v4-flash-free \
+            --model opencode/kimi-k2.5-free \
             2>&1 | tee "$GITHUB_WORKSPACE/e2e/out.txt" || true
           if grep -q "Error" "$GITHUB_WORKSPACE/e2e/out.txt"; then
             echo "E2E FAILED: see out.txt"
@@ -123,7 +123,7 @@ jobs:
           只做这一件事，不要运行 shell 命令，不要读其他文件。
           EOF
           pi -p "$(cat prompt.txt)" --provider opencode-cli \
-            --model opencode/deepseek-v4-flash-free \
+            --model opencode/kimi-k2.5-free \
             2>&1 | tee "$GITHUB_WORKSPACE/e2e2/out.txt" || true
           if grep -q "Error" "$GITHUB_WORKSPACE/e2e2/out.txt"; then
             echo "E2E2 FAILED: see out.txt"
@@ -199,7 +199,7 @@ jobs:
             local start end
             start=$(date +%s%3N)
             PI_PAIR_PROCESS_LOG="$flag" pi -p "$(cat prompt.txt)" \
-              --provider opencode-cli --model opencode/deepseek-v4-flash-free \
+              --provider opencode-cli --model opencode/kimi-k2.5-free \
               >/dev/null 2>&1 || true
             end=$(date +%s%3N)
             local state dur sig
