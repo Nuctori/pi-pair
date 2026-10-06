@@ -30,6 +30,10 @@ jobs:
     name: E2E - pair audit loop (opencode free model)
     runs-on: ubuntu-latest
     needs: unit
+    # 整条链路（pi × opencode-pi 桥 × opencode CLI × 免费模型）全是上游移动目标，
+    # 任何一环漂移都会红（模型下线/桥协议不兼容都实测发生过）。E2E 是机制冒烟而非
+    # 正确性门禁——降级为信息性：失败不挡 CI，信号看本 job 日志与 annotation。
+    continue-on-error: true
     env:
       PI_OFFLINE: "1"
       PI_DECISION_AUDITOR_INJECT: "off"
